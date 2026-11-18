@@ -29,6 +29,7 @@ public class OverlayService extends Service {
     float d, r;
     int bounces = 1;
     boolean shown = true;
+    static volatile boolean running;
     Handle cue, obj, aim, tl, br;
     LinesView lines;
     LinearLayout panel;
@@ -48,6 +49,7 @@ public class OverlayService extends Service {
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         else startForeground(1, n);
         setup();
+        running = true;
         return START_NOT_STICKY;
     }
 
@@ -100,6 +102,7 @@ public class OverlayService extends Service {
 
     @Override public void onDestroy() {
         super.onDestroy();
+        running = false;
         if (wm == null) return;
         for (View v : all) try { wm.removeView(v); } catch (Exception e) {}
         try { wm.removeView(panel); } catch (Exception e) {}
