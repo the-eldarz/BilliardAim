@@ -92,7 +92,7 @@ public class OverlayService extends Service {
 
     Button btn(String t) {
         Button b = new Button(this);
-        b.setText(t); b.setTextSize(12); b.setAllCaps(false);
+        b.setText(t); b.setTextSize(12); if (Build.VERSION.SDK_INT >= 28) b.setAllCaps(false);
         b.setMinWidth(0); b.setMinimumWidth(0); b.setMinHeight(0); b.setMinimumHeight(0);
         b.setPadding((int) (8 * d), (int) (6 * d), (int) (8 * d), (int) (6 * d));
         return b;
