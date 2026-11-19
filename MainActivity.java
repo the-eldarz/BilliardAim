@@ -9,6 +9,7 @@ import android.net.Uri;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.View;
 import android.widget.Button;
@@ -24,6 +25,7 @@ public class MainActivity extends Activity {
     static final int REQ_CAPTURE = 77;
     TextView modeNote; // 0 = как на устройстве, 1 = светлая, 2 = тёмная
     Button toggle;
+    static boolean battAsked = false; // спрашиваем про батарею один раз за запуск приложения
     TextView status;
 
     SharedPreferences prefs() { return getSharedPreferences(PREFS, MODE_PRIVATE); }
@@ -128,6 +130,40 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         refresh();
+        askBattery();
+    }
+
+    boolean ignoringBattery() {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        return pm == null || pm.isIgnoringBatteryOptimizations(getPackageName());
+    }
+
+    // При старте просим не ограничивать приложение батареей, чтобы при низком заряде система не мешала игре
+    void askBattery() {
+        if (battAsked || ignoringBattery()) return;
+        battAsked = true;
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+            .setTitle("Работа при низком заряде")
+            .setMessage("Чтобы прицел не пропадал и не тормозил, когда заряд низкий, разрешите приложению работать без ограничений батареи: на следующем экране нажмите «Разрешить».\n\nЕсли на телефоне включён режим энергосбережения, на время игры лучше его выключить.")
+            .setPositiveButton("Разрешить", (dlg, w) -> requestIgnoreBattery())
+            .setNegativeButton("Позже", null);
+        if (Build.VERSION.SDK_INT >= 22) b.setNeutralButton("Энергосбережение", (dlg, w) -> openSaver());
+        b.show();
+    }
+
+    void requestIgnoreBattery() {
+        try {
+            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            try { startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); }
+            catch (Exception e2) { Toast.makeText(this, "Откройте Настройки, Батарея и отключите ограничения для этого приложения", Toast.LENGTH_LONG).show(); }
+        }
+    }
+
+    void openSaver() {
+        try { startActivity(new Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS)); }
+        catch (Exception e) { Toast.makeText(this, "Откройте Настройки, Батарея и выключите энергосбережение", Toast.LENGTH_LONG).show(); }
     }
 
     void refresh() {
