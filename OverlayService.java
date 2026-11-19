@@ -23,6 +23,7 @@ import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.IBinder;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
@@ -42,7 +43,15 @@ public class OverlayService extends Service {
     int bounces = 1;
     boolean shown = true;
     static volatile boolean running;
-    boolean auto, scanning;
+    boolean auto;
+    int mode;                         // 0 = ручной, 1 = скан по кнопке, 2 = автоскан
+    boolean have, busy, wantShot;     // есть ли результат скана / идёт ли обработка / просили скан
+    int failStreak, sw, sh;
+    long lastScan;
+    float sTL, sTT, sBR, sBB, sR, cX, cY, aX, aY;
+    float[] bX = new float[0], bY = new float[0];
+    ImageReader stream;
+    Runnable watch;
     MediaProjection proj;
     VirtualDisplay vd;
     final Handler ui = new Handler(Looper.getMainLooper());
@@ -62,7 +71,8 @@ public class OverlayService extends Service {
         }
         Notification.Builder nb = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, "aim") : new Notification.Builder(this);
         Notification n = nb.setContentTitle("Линейка прицела включена").setSmallIcon(android.R.drawable.ic_menu_compass).build();
-        auto = in != null && in.getBooleanExtra("auto", false);
+        mode = in != null ? in.getIntExtra("mode", 0) : 0;
+        auto = mode != 0;
         if (Build.VERSION.SDK_INT >= 34) {
             int ft = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
             if (auto) ft |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
@@ -89,6 +99,7 @@ public class OverlayService extends Service {
             }
         }
         setup();
+        if (auto && proj != null) startStream();
         running = true;
         return START_NOT_STICKY;
     }
@@ -106,11 +117,13 @@ public class OverlayService extends Service {
         if (Build.VERSION.SDK_INT >= 28) lp.layoutInDisplayCutoutMode = LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         wm.addView(lines, lp);
         all.add(lines);
-        tl = new Handle(0xFF4FA3FF, "1", w * .12f, h * .22f);
-        br = new Handle(0xFF4FA3FF, "2", w * .88f, h * .85f);
-        cue = new Handle(0xFFFFFFFF, "Б", w * .30f, h * .62f);
-        obj = new Handle(0xFFFF4B3E, "Ш", w * .55f, h * .48f);
-        aim = new Handle(0xFFF2C94C, "+", w * .72f, h * .36f);
+        if (mode == 0) {
+            tl = new Handle(0xFF4FA3FF, "1", w * .12f, h * .22f);
+            br = new Handle(0xFF4FA3FF, "2", w * .88f, h * .85f);
+            cue = new Handle(0xFFFFFFFF, "Б", w * .30f, h * .62f);
+            obj = new Handle(0xFFFF4B3E, "Ш", w * .55f, h * .48f);
+            aim = new Handle(0xFFF2C94C, "+", w * .72f, h * .36f);
+        }
 
         panel = new LinearLayout(this);
         panel.setBackgroundColor(0xCC101A14);
@@ -126,8 +139,10 @@ public class OverlayService extends Service {
             bS.setText(shown ? "Скрыть" : "Показать");
         });
         Button bX = btn("Выход"); bX.setOnClickListener(v -> stopSelf());
-        if (auto) { Button bA = btn("Скан"); bA.setOnClickListener(v -> scan()); panel.addView(bA); }
-        panel.addView(bB); panel.addView(bM); panel.addView(bP); panel.addView(bS); panel.addView(bX);
+        if (mode == 1) { Button bA = btn("Скан"); bA.setOnClickListener(v -> scan()); panel.addView(bA); }
+        panel.addView(bB);
+        if (mode == 0) { panel.addView(bM); panel.addView(bP); }
+        panel.addView(bS); panel.addView(bX);
         LayoutParams pp = new LayoutParams(-2, -2, type(), LayoutParams.FLAG_NOT_FOCUSABLE | LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT);
         pp.gravity = Gravity.BOTTOM | Gravity.LEFT;
         wm.addView(panel, pp);
@@ -145,6 +160,8 @@ public class OverlayService extends Service {
         super.onDestroy();
         running = false;
         ui.removeCallbacksAndMessages(null);
+        try { if (stream != null) stream.close(); } catch (Exception e) {}
+        stream = null;
         try { if (vd != null) vd.release(); } catch (Exception e) {}
         vd = null;
         try { if (proj != null) { MediaProjection p = proj; proj = null; p.stop(); } } catch (Exception e) {}
@@ -156,90 +173,131 @@ public class OverlayService extends Service {
 
     void toast(String t) { Toast.makeText(this, t, Toast.LENGTH_LONG).show(); }
 
-    void setHidden(boolean hide) {
-        for (View x : all) x.setVisibility(hide || !shown ? View.GONE : View.VISIBLE);
-        panel.setVisibility(hide ? View.INVISIBLE : View.VISIBLE);
-    }
+    // ---- Авто-режимы: поток кадров экрана, распознавание, расчёт траектории ----
 
-    // Авто-режим: прячем линейку, снимаем кадр экрана, распознаём стол/биток/линию игры и ставим точки
-    void scan() {
-        if (!auto) return;
+    void scan() {                      // кнопка «Скан»
         if (proj == null) { toast("Нет доступа к экрану. Выключите и включите линейку заново."); return; }
-        if (scanning) return;
-        scanning = true;
-        setHidden(true);
-        ui.postDelayed(this::capture, 350);
+        if (busy) return;
+        wantShot = true;
+        ui.postDelayed(() -> { if (wantShot) { wantShot = false; toast("Не получен кадр экрана. Попробуйте ещё раз."); } }, 2500);
     }
 
-    void capture() {
-        try {
-            DisplayMetrics dm = new DisplayMetrics();
-            wm.getDefaultDisplay().getRealMetrics(dm);
-            final int w = dm.widthPixels, h = dm.heightPixels;
-            final ImageReader rd = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
-            if (vd == null) {
-                vd = proj.createVirtualDisplay("aimruler", w, h, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.getSurface(), null, null);
-            } else {
-                vd.resize(w, h, dm.densityDpi);
-                vd.setSurface(rd.getSurface());
-            }
-            final boolean[] done = {false};
-            rd.setOnImageAvailableListener(rr -> {
-                if (done[0]) return;
-                Image img = null;
-                try { img = rr.acquireLatestImage(); } catch (Exception e) { img = null; }
-                if (img == null) return;
-                done[0] = true;
-                int[] pixels = null;
-                try {
-                    Image.Plane pl = img.getPlanes()[0];
-                    ByteBuffer buf = pl.getBuffer();
-                    int ps = pl.getPixelStride(), rs = pl.getRowStride();
-                    Bitmap bmp = Bitmap.createBitmap(rs / ps, h, Bitmap.Config.ARGB_8888);
-                    bmp.copyPixelsFromBuffer(buf);
-                    pixels = new int[w * h];
-                    bmp.getPixels(pixels, 0, w, 0, 0, w, h);
-                    bmp.recycle();
-                } catch (Throwable e) { pixels = null; }
-                try { img.close(); } catch (Exception e) {}
-                try { if (vd != null) vd.setSurface(null); } catch (Exception e) {}
-                try { rd.close(); } catch (Exception e) {}
-                final int[] px = pixels;
-                new Thread(() -> {
-                    Vision.Result res = null;
-                    try { if (px != null) res = Vision.detect(px, w, h); } catch (Throwable e) { res = null; }
-                    final Vision.Result fr = res;
-                    ui.post(() -> finishScan(fr, "Не удалось обработать кадр экрана."));
-                }).start();
-            }, ui);
-            ui.postDelayed(() -> {
-                if (done[0]) return;
-                done[0] = true;
-                try { if (vd != null) vd.setSurface(null); } catch (Exception e) {}
-                try { rd.close(); } catch (Exception e) {}
-                finishScan(null, "Не получен кадр экрана. Попробуйте ещё раз.");
-            }, 2500);
-        } catch (Throwable e) {
-            finishScan(null, "Ошибка захвата экрана: " + e);
+    void buildStream() {
+        DisplayMetrics dm = new DisplayMetrics();
+        wm.getDefaultDisplay().getRealMetrics(dm);
+        sw = dm.widthPixels; sh = dm.heightPixels;
+        ImageReader old = stream;
+        stream = ImageReader.newInstance(sw, sh, PixelFormat.RGBA_8888, 2);
+        if (vd == null) {
+            vd = proj.createVirtualDisplay("aimruler", sw, sh, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, stream.getSurface(), null, null);
+        } else {
+            vd.resize(sw, sh, dm.densityDpi);
+            vd.setSurface(stream.getSurface());
         }
+        stream.setOnImageAvailableListener(this::onFrame, ui);
+        if (old != null) { try { old.close(); } catch (Exception e) {} }
     }
 
-    void finishScan(Vision.Result res, String err) {
-        scanning = false;
+    void startStream() {
+        try { buildStream(); } catch (Throwable e) { toast("Ошибка захвата экрана: " + e); return; }
+        watch = new Runnable() {
+            @Override public void run() {
+                if (wm == null || proj == null) return;
+                try {
+                    DisplayMetrics dm = new DisplayMetrics();
+                    wm.getDefaultDisplay().getRealMetrics(dm);
+                    if (dm.widthPixels != sw || dm.heightPixels != sh) buildStream();   // экран повернули
+                } catch (Throwable e) {}
+                ui.postDelayed(this, 1000);
+            }
+        };
+        ui.postDelayed(watch, 1000);
+    }
+
+    void onFrame(ImageReader rd) {
+        Image img = null;
+        try { img = rd.acquireLatestImage(); } catch (Throwable e) { img = null; }
+        if (img == null) return;
+        long now = SystemClock.uptimeMillis();
+        boolean take = !busy && (wantShot || (mode == 2 && now - lastScan > 300));
+        if (!take) { try { img.close(); } catch (Exception e) {} return; }
+        busy = true; wantShot = false; lastScan = now;
+        final int w = img.getWidth(), h = img.getHeight();
+        int[] pixels = null;
+        try {
+            Image.Plane pl = img.getPlanes()[0];
+            ByteBuffer buf = pl.getBuffer();
+            int ps = pl.getPixelStride(), rs = pl.getRowStride();
+            Bitmap bmp = Bitmap.createBitmap(rs / ps, h, Bitmap.Config.ARGB_8888);
+            bmp.copyPixelsFromBuffer(buf);
+            pixels = new int[w * h];
+            bmp.getPixels(pixels, 0, w, 0, 0, w, h);
+            bmp.recycle();
+        } catch (Throwable e) { pixels = null; }
+        try { img.close(); } catch (Exception e) {}
+        final int[] px = pixels;
+        new Thread(() -> {
+            Vision.Result res = null;
+            try { if (px != null) res = Vision.detect(px, w, h); } catch (Throwable e) { res = null; }
+            final Vision.Result fr = res;
+            ui.post(() -> finishScan(fr));
+        }).start();
+    }
+
+    void finishScan(Vision.Result res) {
+        busy = false;
         if (wm == null) return;
-        setHidden(false);
-        if (res == null) { toast(err); return; }
-        if (!res.ok) { toast(res.msg); return; }
-        tl.pos.set(res.l, res.t); br.pos.set(res.rr, res.b);
-        r = res.r;
-        cue.pos.set(res.cx, res.cy); aim.pos.set(res.ax, res.ay);
-        if (res.hasObj) obj.pos.set(res.ox, res.oy);
-        for (Handle hd : new Handle[]{tl, br, cue, obj, aim}) {
-            hd.move();
-            try { wm.updateViewLayout(hd, hd.lp); } catch (Exception e) {}
+        if (res != null && res.ok) {
+            have = true; failStreak = 0;
+            sTL = res.l; sTT = res.t; sBR = res.rr; sBB = res.b; sR = res.r;
+            cX = res.cx; cY = res.cy; aX = res.ax; aY = res.ay;
+            int n = res.nb + (res.hasObj ? 1 : 0);
+            float[] nx = new float[n], ny = new float[n]; int k = 0;
+            for (int i = 0; i < res.nb; i++) { nx[k] = res.bx[i]; ny[k] = res.by[i]; k++; }
+            if (res.hasObj) {
+                boolean dup = false;
+                for (int i = 0; i < res.nb; i++) if (Math.hypot(res.bx[i] - res.ox, res.by[i] - res.oy) < 0.7f * res.r) { dup = true; nx[i] = res.ox; ny[i] = res.oy; }
+                if (!dup) { nx[k] = res.ox; ny[k] = res.oy; k++; }
+            }
+            bX = java.util.Arrays.copyOf(nx, k); bY = java.util.Arrays.copyOf(ny, k);
+        } else {
+            failStreak++;
+            if (mode == 1) { toast(res == null ? "Не удалось обработать кадр экрана." : res.msg); }
+            if (mode == 1 || failStreak >= 3) have = false;
         }
         lines.invalidate();
-        toast(res.msg);
+    }
+
+    float[][] pocketsN() {
+        float cx = (sTL + sBR) / 2, cr = 2.5f * sR, sr = 2.2f * sR;
+        return new float[][]{{sTL, sTT, cr}, {sBR, sTT, cr}, {sTL, sBB, cr}, {sBR, sBB, cr}, {cx, sTT, sr}, {cx, sBB, sr}};
+    }
+
+    // Траектория шара с отскоками от бортов; останавливается на лузе или на первом шаре (кроме skip)
+    Tr traceN(float x, float y, float dx, float dy, int maxB, int skip, float maxLen) {
+        Tr t = new Tr();
+        t.pts.add(new float[]{x, y});
+        float l = sTL + sR, rr = sBR - sR, tp = sTT + sR, bt = sBB - sR;
+        float[][] pk = pocketsN();
+        float step = Math.max(1f, sR * 0.08f), len = 0;
+        int b = 0;
+        while (len < maxLen) {
+            x += dx * step; y += dy * step; len += step;
+            for (int i = 0; i < 6; i++) if (Math.hypot(x - pk[i][0], y - pk[i][1]) < pk[i][2]) { t.pocket = i; break; }
+            if (t.pocket >= 0) break;
+            for (int i = 0; i < bX.length; i++) {
+                if (i == skip) continue;
+                if (Math.hypot(x - bX[i], y - bY[i]) <= 2 * sR) { t.hi = i; break; }
+            }
+            if (t.hi >= 0) break;
+            boolean bn = false;
+            if (x < l) { x = 2 * l - x; dx = -dx; bn = true; } else if (x > rr) { x = 2 * rr - x; dx = -dx; bn = true; }
+            if (y < tp) { y = 2 * tp - y; dy = -dy; bn = true; } else if (y > bt) { y = 2 * bt - y; dy = -dy; bn = true; }
+            if (bn) { b++; t.pts.add(new float[]{x, y}); if (b > maxB) break; }
+        }
+        t.pts.add(new float[]{x, y});
+        t.dx = dx; t.dy = dy; t.x = x; t.y = y;
+        return t;
     }
 
     // Перетаскиваемая точка
@@ -283,7 +341,7 @@ public class OverlayService extends Service {
 
     static class Tr {
         ArrayList<float[]> pts = new ArrayList<>();
-        int pocket = -1; boolean hit; float dx, dy, x, y;
+        int pocket = -1, hi = -1; boolean hit; float dx, dy, x, y;
     }
 
     float[][] pockets() {
@@ -329,7 +387,64 @@ public class OverlayService extends Service {
             for (int i = 0; i < pts.size(); i++) { float[] a = pts.get(i); if (i == 0) q.moveTo(a[0], a[1]); else q.lineTo(a[0], a[1]); }
             return q;
         }
+        void drawClean(Canvas c) {
+            final int PINK = 0xFFFF4FB8, GREEN = 0xFF5FE08A, YELLOW = 0xFFF2C94C, RED = 0xFFFF6B5E;
+            tx.setTextAlign(Paint.Align.CENTER); tx.setTextSize(18 * d); tx.setShadowLayer(4 * d, 0, 0, 0xFF000000);
+            if (!have) {
+                if (mode == 1) { tx.setColor(0xFFFFFFFF); c.drawText("Прицельтесь и нажмите «Скан»", getWidth() / 2f, 40 * d, tx); }
+                return;
+            }
+            float R = sR;
+            float dx = aX - cX, dy = aY - cY, n = (float) Math.hypot(dx, dy);
+            if (n < 1) n = 1; dx /= n; dy /= n;
+            Tr ct = traceN(cX, cY, dx, dy, bounces, -1, 8000);
+            boolean bank = ct.pts.size() > 2;
+            p.setPathEffect(null); p.setStyle(Paint.Style.STROKE);
+            // первый отрезок до касания рисует сама игра; мы рисуем всё, что после него (отскоки от бортов)
+            if (bank) {
+                p.setStrokeWidth(2.5f * d); p.setColor(PINK);
+                c.drawPath(path(new ArrayList<>(ct.pts.subList(1, ct.pts.size()))), p);
+            }
+            String msg; int mc = 0xFFFFFFFF;
+            if (ct.pocket >= 0) { msg = "Биток упадёт в лузу"; mc = RED; }
+            else if (ct.hi < 0) msg = bank ? "После отскока биток не касается шаров" : "Биток не касается шаров";
+            else {
+                float ox = bX[ct.hi], oy = bY[ct.hi];
+                if (bank) {
+                    p.setStrokeWidth(1.5f * d); p.setColor(PINK);
+                    p.setPathEffect(new DashPathEffect(new float[]{8 * d, 6 * d}, 0));
+                    c.drawCircle(ct.x, ct.y, R, p); p.setPathEffect(null);
+                }
+                float nx = ox - ct.x, ny = oy - ct.y, nn = (float) Math.hypot(nx, ny);
+                if (nn < 1) nn = 1; nx /= nn; ny /= nn;
+                Tr ot = trace2(ox, oy, nx, ny, ct.hi);
+                boolean good = ot.pocket >= 0;
+                p.setStrokeWidth(3 * d); p.setColor(good ? GREEN : YELLOW);
+                c.drawPath(path(ot.pts), p);
+                if (good) {
+                    float[] pt = ot.pts.get(ot.pts.size() - 1);
+                    p.setStyle(Paint.Style.FILL); c.drawCircle(pt[0], pt[1], 6 * d, p); p.setStyle(Paint.Style.STROKE);
+                }
+                float cs = ct.dx * nx + ct.dy * ny;
+                float px = ct.dx - cs * nx, py = ct.dy - cs * ny, pm = (float) Math.hypot(px, py);
+                if (pm > 0.05f) {
+                    Tr post = traceN(ct.x, ct.y, px / pm, py / pm, 1, ct.hi, 12 * R);
+                    p.setStrokeWidth(1.5f * d); p.setColor(PINK);
+                    p.setPathEffect(new DashPathEffect(new float[]{6 * d, 5 * d}, 0));
+                    c.drawPath(path(post.pts), p); p.setPathEffect(null);
+                }
+                int cut = (int) Math.round(Math.toDegrees(Math.acos(Math.max(-1f, Math.min(1f, cs)))));
+                msg = (bank ? "После отскока: " : "") + (good ? (bank ? "шар попадёт в лузу" : "Шар попадёт в лузу") : (bank ? "шар не попадёт" : "Шар не попадёт")) + " · угол " + cut + "°";
+                mc = good ? GREEN : RED;
+            }
+            tx.setColor(mc);
+            c.drawText(msg, getWidth() / 2f, 40 * d, tx);
+        }
+
+        Tr trace2(float x, float y, float dx, float dy, int skip) { return traceN(x, y, dx, dy, bounces, skip, 8000); }
+
         @Override protected void onDraw(Canvas c) {
+            if (mode != 0) { drawClean(c); return; }
             float l = Math.min(tl.pos.x, br.pos.x), rr = Math.max(tl.pos.x, br.pos.x);
             float t = Math.min(tl.pos.y, br.pos.y), b = Math.max(tl.pos.y, br.pos.y);
             p.setPathEffect(null); p.setStrokeWidth(1.5f * d); p.setColor(0x66FFFFFF);
@@ -388,6 +503,8 @@ class Vision {
         public float ax, ay;                  // центр «призрачного» битка: где линия прицела игры заканчивается
         public boolean hasObj;
         public float ox, oy;                  // шар, в который целимся
+        public int nb;                        // все остальные шары на столе (без битка)
+        public float[] bx = new float[0], by = new float[0];
     }
 
     public static boolean DEBUG = false;
@@ -582,12 +699,72 @@ class Vision {
             }
             res.hasObj = true; res.ox = (float) (sx / n); res.oy = (float) (sy / n);
         }
+        findBalls(px, w, h, res, h0);
         res.ok = true;
         res.msg = res.hasObj ? "Готово: стол, биток, прицел и шар найдены." : "Стол, биток и прицел найдены. Шар на линии не найден (линия идёт в борт).";
         return res;
     }
 
     /** Ищет белую линию прицела, выходящую из точки (cx,cy). Возвращает {длина, угол, cx', cy', конецX, конецY} или null. */
+    /** Все шары на столе (кроме битка): «не сукно» -> стирание тонких линий и кия -> центры пятен; слипшиеся пятна делим усиленным стиранием. */
+    static void findBalls(int[] px, int w, int h, Result res, float h0) {
+        float[] t = new float[3];
+        float r = res.r;
+        int il = Math.round(res.l), it = Math.round(res.t), ir = Math.round(res.rr), ib = Math.round(res.b);
+        int mw = (ir - il) / 2 + 1, mh = (ib - it) / 2 + 1;
+        boolean[] m = new boolean[mw * mh];
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
+            int X = il + 2 * x, Y = it + 2 * y;
+            if (X >= w || Y >= h) continue;
+            m[y * mw + x] = !cloth(px[Y * w + X], h0, t);
+        }
+        int e = Math.max(2, Math.round(0.42f * r / 2f));
+        double single = Math.PI * Math.pow(0.9 * r / 2 - e, 2);
+        boolean[] er = erode(m, mw, mh, e);
+        int[] lab = label(er, mw, mh);
+        int n = 0; for (int v : lab) if (v > n) n = v;
+        double[] area = new double[n + 1], sx = new double[n + 1], sy = new double[n + 1];
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) { int v = lab[y * mw + x]; if (v == 0) continue; area[v]++; sx[v] += x; sy[v] += y; }
+        float[] cx = new float[64], cy = new float[64]; int nc = 0;
+        // подготовим усиленные стирания лениво
+        boolean[][] er2 = new boolean[5][]; int[][] lab2 = new int[5][];
+        for (int L = 1; L <= n; L++) {
+            if (area[L] < 0.35 * single) continue;
+            if (area[L] <= 1.9 * single) {
+                if (nc < 64) { cx[nc] = (float) (sx[L] / area[L]); cy[nc] = (float) (sy[L] / area[L]); nc++; }
+                continue;
+            }
+            // большое пятно: несколько слипшихся шаров
+            int bestCnt = 0, bestLvl = -1;
+            for (int k = 1; k <= 4; k++) {
+                if (er2[k] == null) { er2[k] = erode(m, mw, mh, e + k); lab2[k] = label(er2[k], mw, mh); }
+                int n2 = 0; for (int v : lab2[k]) if (v > n2) n2 = v;
+                double[] a2 = new double[n2 + 1]; boolean[] inL = new boolean[n2 + 1];
+                for (int i = 0; i < mw * mh; i++) { int v = lab2[k][i]; if (v != 0 && lab[i] == L) { a2[v]++; inL[v] = true; } }
+                int cnt = 0; for (int v = 1; v <= n2; v++) if (inL[v] && a2[v] >= 0.2 * single) cnt++;
+                if (cnt > bestCnt) { bestCnt = cnt; bestLvl = k; }
+            }
+            if (bestCnt >= 2) {
+                int k = bestLvl; int n2 = 0; for (int v : lab2[k]) if (v > n2) n2 = v;
+                double[] a2 = new double[n2 + 1], x2 = new double[n2 + 1], y2 = new double[n2 + 1]; boolean[] inL = new boolean[n2 + 1];
+                for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) { int v = lab2[k][y * mw + x]; if (v != 0 && lab[y * mw + x] == L) { a2[v]++; x2[v] += x; y2[v] += y; inL[v] = true; } }
+                for (int v = 1; v <= n2; v++) if (inL[v] && a2[v] >= 0.2 * single && nc < 64) { cx[nc] = (float) (x2[v] / a2[v]); cy[nc] = (float) (y2[v] / a2[v]); nc++; }
+            } else if (nc < 64) { cx[nc] = (float) (sx[L] / area[L]); cy[nc] = (float) (sy[L] / area[L]); nc++; }
+        }
+        float pcx = (res.l + res.rr) / 2f;
+        float[] ox = new float[nc], oy = new float[nc]; int no = 0;
+        for (int i = 0; i < nc; i++) {
+            float X = il + 2 * cx[i], Y = it + 2 * cy[i];
+            if (Math.hypot(X - res.cx, Y - res.cy) < 1.2 * r) continue; // это биток
+            boolean nearL = X < res.l + 2.6f * r || X > res.rr - 2.6f * r;
+            boolean nearT = Y < res.t + 2.6f * r || Y > res.b - 2.6f * r;
+            if (nearL && nearT) continue;                                  // угловая лунка
+            if (Math.abs(X - pcx) < 2.3f * r && (Y < res.t + 2.3f * r || Y > res.b - 2.3f * r)) continue; // боковая лунка
+            ox[no] = X; oy[no] = Y; no++;
+        }
+        res.nb = no; res.bx = java.util.Arrays.copyOf(ox, no); res.by = java.util.Arrays.copyOf(oy, no);
+    }
+
     static double[] aimFrom(int[] px, int w, int h, float cx, float cy, float r, double maxT) {
         float t0 = 1.25f * r;
         double bestL = 0, bestA = 0;

@@ -76,7 +76,7 @@ public class MainActivity extends Activity {
         ll.addView(mt, lp(24));
 
         RadioGroup mg = new RadioGroup(this);
-        String[] mn = {"Ручной", "Авто (по экрану)"};
+        String[] mn = {"Ручной", "Скан по кнопке", "Автоскан"};
         int curMode = prefs().getInt(KEY_MODE, 0);
         for (int i = 0; i < mn.length; i++) {
             RadioButton rb = new RadioButton(this);
@@ -149,17 +149,18 @@ public class MainActivity extends Activity {
             return;
         }
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
-        if (prefs().getInt(KEY_MODE, 0) == 1) {
+        if (prefs().getInt(KEY_MODE, 0) != 0) {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
             startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE);
             return;
         }
-        startOverlay(false, 0, null);
+        startOverlay(0, 0, null);
     }
 
-    void startOverlay(boolean auto, int code, Intent data) {
+    void startOverlay(int mode, int code, Intent data) {
         Intent i = new Intent(this, OverlayService.class);
-        if (auto) { i.putExtra("auto", true); i.putExtra("code", code); i.putExtra("data", data); }
+        i.putExtra("mode", mode);
+        if (mode != 0) { i.putExtra("code", code); i.putExtra("data", data); }
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
         OverlayService.running = true;
         refresh();
@@ -169,14 +170,15 @@ public class MainActivity extends Activity {
     @Override protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
         if (req == REQ_CAPTURE) {
-            if (res == RESULT_OK && data != null) startOverlay(true, res, data);
+            if (res == RESULT_OK && data != null) startOverlay(prefs().getInt(KEY_MODE, 0), res, data);
             else Toast.makeText(this, "Без разрешения на запись экрана авто-режим не работает", Toast.LENGTH_LONG).show();
         }
     }
 
     String modeText(int m) {
-        return m == 1 ? "Авто: при включении Android спросит разрешение на запись экрана. На панели появится кнопка «Скан». Используйте только в тренировке или офлайн, не против людей."
-                      : "Ручной: точки и кольца вы двигаете сами.";
+        if (m == 1) return "Скан по кнопке: на панели появится «Скан». Нажали, и линейка один раз сама находит шары и считает траекторию. Android спросит разрешение на запись экрана.";
+        if (m == 2) return "Автоскан: линейка сама обновляет траекторию, пока вы двигаете прицел. Android спросит разрешение на запись экрана. Используйте только в тренировке или офлайн, не против людей.";
+        return "Ручной: точки и кольца вы двигаете сами.";
     }
 
     void showHelp() {
@@ -188,12 +190,14 @@ public class MainActivity extends Activity {
             + "4. Кнопками R- и R+ подгоните кольца под размер шаров.\n"
             + "5. Белая точка (Б): биток. Красная (Ш): шар, который бьёте. Жёлтая (+): направление удара.\n"
             + "6. Зелёная линия: шар идёт в лузу. Жёлтая: не идёт.\n\n"
-            + "АВТО-РЕЖИМ\n"
-            + "1. Выберите «Авто (по экрану)» и нажмите «Включить». Разрешите запись экрана.\n"
-            + "2. В игре (тренировка) наведите кий: игра покажет белую линию.\n"
-            + "3. Нажмите «Скан» на панели. Линейка сама найдёт стол, биток и шар и поставит точки.\n"
-            + "4. Точки можно поправить вручную. Если не нашлось, нажмите «Скан» ещё раз.\n"
-            + "Авто-режим используйте только в тренировке или офлайн, не против людей.\n\n"
+            + "СКАН ПО КНОПКЕ И АВТОСКАН\n"
+            + "1. Выберите режим и нажмите «Включить». Разрешите запись экрана.\n"
+            + "2. В игре наведите кий: игра сама рисует белую линию прицела.\n"
+            + "3. В режиме «по кнопке» нажмите «Скан» на панели. В «Автоскане» ничего нажимать не нужно.\n"
+            + "4. Линейка рисует только то, что нужно: путь шара и битка после касания, отскоки от бортов. Зелёная линия: шар попадёт в лузу, жёлтая: нет. Розовая: путь битка.\n"
+            + "5. Если целитесь в борт, линейка покажет отскок и скажет, попадёт ли биток после него в шар.\n"
+            + "6. Если ничего не появилось, наведите кий так, чтобы игра показала линию, и повторите скан.\n"
+            + "Используйте только в тренировке или офлайн, не против людей.\n\n"
             + "ПАНЕЛЬ\n"
             + "«Отскоки»: сколько раз линия отражается от бортов (0-3). «Скрыть» убирает линейку, «Показать» возвращает. «Выход» закрывает её совсем.\n\n"
             + "Выключить линейку можно и здесь, кнопкой «Выключить».";
