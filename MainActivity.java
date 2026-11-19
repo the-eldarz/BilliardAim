@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.net.Uri;
+import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
@@ -19,7 +20,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 public class MainActivity extends Activity {
-    static final String PREFS = "aim", KEY_THEME = "theme"; // 0 = как на устройстве, 1 = светлая, 2 = тёмная
+    static final String PREFS = "aim", KEY_THEME = "theme", KEY_MODE = "mode"; // режим: 0 = ручной, 1 = авто
+    static final int REQ_CAPTURE = 77;
+    TextView modeNote; // 0 = как на устройстве, 1 = светлая, 2 = тёмная
     Button toggle;
     TextView status;
 
@@ -67,10 +70,31 @@ public class MainActivity extends Activity {
         help.setOnClickListener(v -> showHelp());
         ll.addView(help, lp(8));
 
-        TextView mode = new TextView(this);
-        mode.setText("Режим: ручной. Точки и кольца вы двигаете сами.");
-        mode.setTextSize(14);
-        ll.addView(mode, lp(24));
+        TextView mt = new TextView(this);
+        mt.setText("Режим прицела");
+        mt.setTextSize(16);
+        ll.addView(mt, lp(24));
+
+        RadioGroup mg = new RadioGroup(this);
+        String[] mn = {"Ручной", "Авто (по экрану)"};
+        int curMode = prefs().getInt(KEY_MODE, 0);
+        for (int i = 0; i < mn.length; i++) {
+            RadioButton rb = new RadioButton(this);
+            rb.setText(mn[i]);
+            rb.setId(200 + i);
+            mg.addView(rb);
+            if (i == curMode) rb.setChecked(true);
+        }
+        modeNote = new TextView(this);
+        modeNote.setTextSize(13);
+        modeNote.setText(modeText(curMode));
+        mg.setOnCheckedChangeListener((g, id) -> {
+            int v = id - 200;
+            prefs().edit().putInt(KEY_MODE, v).apply();
+            modeNote.setText(modeText(v));
+        });
+        ll.addView(mg, lp(4));
+        ll.addView(modeNote, lp(2));
 
         TextView th = new TextView(this);
         th.setText("Тема оформления");
@@ -125,23 +149,53 @@ public class MainActivity extends Activity {
             return;
         }
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+        if (prefs().getInt(KEY_MODE, 0) == 1) {
+            MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE);
+            return;
+        }
+        startOverlay(false, 0, null);
+    }
+
+    void startOverlay(boolean auto, int code, Intent data) {
         Intent i = new Intent(this, OverlayService.class);
+        if (auto) { i.putExtra("auto", true); i.putExtra("code", code); i.putExtra("data", data); }
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
         OverlayService.running = true;
         refresh();
         moveTaskToBack(true);
     }
 
+    @Override protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req == REQ_CAPTURE) {
+            if (res == RESULT_OK && data != null) startOverlay(true, res, data);
+            else Toast.makeText(this, "Без разрешения на запись экрана авто-режим не работает", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    String modeText(int m) {
+        return m == 1 ? "Авто: при включении Android спросит разрешение на запись экрана. На панели появится кнопка «Скан». Используйте только в тренировке или офлайн, не против людей."
+                      : "Ручной: точки и кольца вы двигаете сами.";
+    }
+
     void showHelp() {
         String text = "Линейка рисуется поверх любой игры.\n\n"
+            + "РУЧНОЙ РЕЖИМ\n"
             + "1. Нажмите «Включить» и разрешите показ поверх других приложений.\n"
             + "2. Откройте игру.\n"
-            + "3. Синие точки 1 и 2: поставьте на внутренние углы стола (верхний левый и нижний правый).\n"
-            + "4. Кнопками R- и R+ внизу подгоните кольца под размер шаров.\n"
+            + "3. Синие точки 1 и 2: на внутренние углы стола (верхний левый и нижний правый).\n"
+            + "4. Кнопками R- и R+ подгоните кольца под размер шаров.\n"
             + "5. Белая точка (Б): биток. Красная (Ш): шар, который бьёте. Жёлтая (+): направление удара.\n"
-            + "6. Зелёная линия: шар идёт в лузу. Жёлтая: не идёт.\n"
-            + "7. «Отскоки»: сколько раз линия отражается от бортов (0-3).\n"
-            + "8. «Скрыть» убирает линейку, чтобы играть, «Показать» возвращает. «Выход» закрывает её совсем.\n\n"
+            + "6. Зелёная линия: шар идёт в лузу. Жёлтая: не идёт.\n\n"
+            + "АВТО-РЕЖИМ\n"
+            + "1. Выберите «Авто (по экрану)» и нажмите «Включить». Разрешите запись экрана.\n"
+            + "2. В игре (тренировка) наведите кий: игра покажет белую линию.\n"
+            + "3. Нажмите «Скан» на панели. Линейка сама найдёт стол, биток и шар и поставит точки.\n"
+            + "4. Точки можно поправить вручную. Если не нашлось, нажмите «Скан» ещё раз.\n"
+            + "Авто-режим используйте только в тренировке или офлайн, не против людей.\n\n"
+            + "ПАНЕЛЬ\n"
+            + "«Отскоки»: сколько раз линия отражается от бортов (0-3). «Скрыть» убирает линейку, «Показать» возвращает. «Выход» закрывает её совсем.\n\n"
             + "Выключить линейку можно и здесь, кнопкой «Выключить».";
         new AlertDialog.Builder(this).setTitle("Как пользоваться").setMessage(text).setPositiveButton("Понятно", null).show();
     }

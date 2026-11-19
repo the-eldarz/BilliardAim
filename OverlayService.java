@@ -4,15 +4,25 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.PointF;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.media.Image;
+import android.media.ImageReader;
+import android.media.projection.MediaProjection;
+import android.media.projection.MediaProjectionManager;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.IBinder;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
@@ -22,6 +32,8 @@ import android.view.WindowManager;
 import android.view.WindowManager.LayoutParams;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.Toast;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 
 public class OverlayService extends Service {
@@ -30,6 +42,10 @@ public class OverlayService extends Service {
     int bounces = 1;
     boolean shown = true;
     static volatile boolean running;
+    boolean auto, scanning;
+    MediaProjection proj;
+    VirtualDisplay vd;
+    final Handler ui = new Handler(Looper.getMainLooper());
     Handle cue, obj, aim, tl, br;
     LinesView lines;
     LinearLayout panel;
@@ -46,8 +62,32 @@ public class OverlayService extends Service {
         }
         Notification.Builder nb = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, "aim") : new Notification.Builder(this);
         Notification n = nb.setContentTitle("Линейка прицела включена").setSmallIcon(android.R.drawable.ic_menu_compass).build();
-        if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-        else startForeground(1, n);
+        auto = in != null && in.getBooleanExtra("auto", false);
+        if (Build.VERSION.SDK_INT >= 34) {
+            int ft = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+            if (auto) ft |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+            startForeground(1, n, ft);
+        } else if (auto && Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(1, n);
+        }
+        if (auto) {
+            try {
+                Intent data = in.getParcelableExtra("data");
+                MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                proj = mpm.getMediaProjection(in.getIntExtra("code", 0), data);
+                proj.registerCallback(new MediaProjection.Callback() {
+                    @Override public void onStop() {
+                        proj = null; vd = null;
+                        toast("Запись экрана остановлена. Включите линейку заново.");
+                    }
+                }, ui);
+            } catch (Exception e) {
+                proj = null;
+                toast("Не удалось начать запись экрана: " + e);
+            }
+        }
         setup();
         running = true;
         return START_NOT_STICKY;
@@ -86,6 +126,7 @@ public class OverlayService extends Service {
             bS.setText(shown ? "Скрыть" : "Показать");
         });
         Button bX = btn("Выход"); bX.setOnClickListener(v -> stopSelf());
+        if (auto) { Button bA = btn("Скан"); bA.setOnClickListener(v -> scan()); panel.addView(bA); }
         panel.addView(bB); panel.addView(bM); panel.addView(bP); panel.addView(bS); panel.addView(bX);
         LayoutParams pp = new LayoutParams(-2, -2, type(), LayoutParams.FLAG_NOT_FOCUSABLE | LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT);
         pp.gravity = Gravity.BOTTOM | Gravity.LEFT;
@@ -103,10 +144,102 @@ public class OverlayService extends Service {
     @Override public void onDestroy() {
         super.onDestroy();
         running = false;
+        ui.removeCallbacksAndMessages(null);
+        try { if (vd != null) vd.release(); } catch (Exception e) {}
+        vd = null;
+        try { if (proj != null) { MediaProjection p = proj; proj = null; p.stop(); } } catch (Exception e) {}
         if (wm == null) return;
         for (View v : all) try { wm.removeView(v); } catch (Exception e) {}
         try { wm.removeView(panel); } catch (Exception e) {}
         wm = null;
+    }
+
+    void toast(String t) { Toast.makeText(this, t, Toast.LENGTH_LONG).show(); }
+
+    void setHidden(boolean hide) {
+        for (View x : all) x.setVisibility(hide || !shown ? View.GONE : View.VISIBLE);
+        panel.setVisibility(hide ? View.INVISIBLE : View.VISIBLE);
+    }
+
+    // Авто-режим: прячем линейку, снимаем кадр экрана, распознаём стол/биток/линию игры и ставим точки
+    void scan() {
+        if (!auto) return;
+        if (proj == null) { toast("Нет доступа к экрану. Выключите и включите линейку заново."); return; }
+        if (scanning) return;
+        scanning = true;
+        setHidden(true);
+        ui.postDelayed(this::capture, 350);
+    }
+
+    void capture() {
+        try {
+            DisplayMetrics dm = new DisplayMetrics();
+            wm.getDefaultDisplay().getRealMetrics(dm);
+            final int w = dm.widthPixels, h = dm.heightPixels;
+            final ImageReader rd = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
+            if (vd == null) {
+                vd = proj.createVirtualDisplay("aimruler", w, h, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.getSurface(), null, null);
+            } else {
+                vd.resize(w, h, dm.densityDpi);
+                vd.setSurface(rd.getSurface());
+            }
+            final boolean[] done = {false};
+            rd.setOnImageAvailableListener(rr -> {
+                if (done[0]) return;
+                Image img = null;
+                try { img = rr.acquireLatestImage(); } catch (Exception e) { img = null; }
+                if (img == null) return;
+                done[0] = true;
+                int[] pixels = null;
+                try {
+                    Image.Plane pl = img.getPlanes()[0];
+                    ByteBuffer buf = pl.getBuffer();
+                    int ps = pl.getPixelStride(), rs = pl.getRowStride();
+                    Bitmap bmp = Bitmap.createBitmap(rs / ps, h, Bitmap.Config.ARGB_8888);
+                    bmp.copyPixelsFromBuffer(buf);
+                    pixels = new int[w * h];
+                    bmp.getPixels(pixels, 0, w, 0, 0, w, h);
+                    bmp.recycle();
+                } catch (Throwable e) { pixels = null; }
+                try { img.close(); } catch (Exception e) {}
+                try { if (vd != null) vd.setSurface(null); } catch (Exception e) {}
+                try { rd.close(); } catch (Exception e) {}
+                final int[] px = pixels;
+                new Thread(() -> {
+                    Vision.Result res = null;
+                    try { if (px != null) res = Vision.detect(px, w, h); } catch (Throwable e) { res = null; }
+                    final Vision.Result fr = res;
+                    ui.post(() -> finishScan(fr, "Не удалось обработать кадр экрана."));
+                }).start();
+            }, ui);
+            ui.postDelayed(() -> {
+                if (done[0]) return;
+                done[0] = true;
+                try { if (vd != null) vd.setSurface(null); } catch (Exception e) {}
+                try { rd.close(); } catch (Exception e) {}
+                finishScan(null, "Не получен кадр экрана. Попробуйте ещё раз.");
+            }, 2500);
+        } catch (Throwable e) {
+            finishScan(null, "Ошибка захвата экрана: " + e);
+        }
+    }
+
+    void finishScan(Vision.Result res, String err) {
+        scanning = false;
+        if (wm == null) return;
+        setHidden(false);
+        if (res == null) { toast(err); return; }
+        if (!res.ok) { toast(res.msg); return; }
+        tl.pos.set(res.l, res.t); br.pos.set(res.rr, res.b);
+        r = res.r;
+        cue.pos.set(res.cx, res.cy); aim.pos.set(res.ax, res.ay);
+        if (res.hasObj) obj.pos.set(res.ox, res.oy);
+        for (Handle hd : new Handle[]{tl, br, cue, obj, aim}) {
+            hd.move();
+            try { wm.updateViewLayout(hd, hd.lp); } catch (Exception e) {}
+        }
+        lines.invalidate();
+        toast(res.msg);
     }
 
     // Перетаскиваемая точка
@@ -122,6 +255,7 @@ public class OverlayService extends Service {
                 LayoutParams.FLAG_NOT_FOCUSABLE | LayoutParams.FLAG_NOT_TOUCH_MODAL | LayoutParams.FLAG_LAYOUT_IN_SCREEN | LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
             lp.gravity = Gravity.TOP | Gravity.LEFT;
+            if (Build.VERSION.SDK_INT >= 28) lp.layoutInDisplayCutoutMode = LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             move();
             wm.addView(this, lp);
             all.add(this);
@@ -240,5 +374,292 @@ public class OverlayService extends Service {
             tx.setShadowLayer(4 * d, 0, 0, 0xFF000000);
             c.drawText(msg, getWidth() / 2f, 40 * d, tx);
         }
+    }
+}
+
+
+/** Распознавание стола, битка, линии прицела игры и прицельного шара по снимку экрана. Чистая Java. */
+class Vision {
+    public static class Result {
+        public boolean ok;
+        public String msg = "";
+        public float l, t, rr, b, r;          // внутренняя область сукна и радиус шара (пиксели экрана)
+        public float cx, cy;                  // биток
+        public float ax, ay;                  // центр «призрачного» битка: где линия прицела игры заканчивается
+        public boolean hasObj;
+        public float ox, oy;                  // шар, в который целимся
+    }
+
+    public static boolean DEBUG = false;
+
+    static int R(int p) { return (p >> 16) & 255; }
+    static int G(int p) { return (p >> 8) & 255; }
+    static int B(int p) { return p & 255; }
+
+    /** hsv: [0]=оттенок 0..360, [1]=насыщенность, [2]=яркость */
+    static void hsv(int p, float[] o) {
+        float r = R(p) / 255f, g = G(p) / 255f, b = B(p) / 255f;
+        float mx = Math.max(r, Math.max(g, b)), mn = Math.min(r, Math.min(g, b)), d = mx - mn;
+        float h;
+        if (d == 0) h = 0;
+        else if (mx == r) h = 60f * (((g - b) / d) % 6f);
+        else if (mx == g) h = 60f * ((b - r) / d + 2f);
+        else h = 60f * ((r - g) / d + 4f);
+        if (h < 0) h += 360f;
+        o[0] = h; o[1] = mx == 0 ? 0 : d / mx; o[2] = mx;
+    }
+
+    static boolean cloth(int p, float h0, float[] t) {
+        hsv(p, t);
+        float dh = Math.abs(t[0] - h0);
+        if (dh > 180) dh = 360 - dh;
+        return dh <= 14f && t[1] > 0.35f && t[2] > 0.30f;
+    }
+
+    static boolean whiteish(int p) {
+        int r = R(p), g = G(p), b = B(p);
+        return r >= 165 && g >= 160 && b >= 130 && r - b <= 75 && Math.abs(r - g) <= 30;
+    }
+
+    static boolean line(int p) { return Math.min(R(p), Math.min(G(p), B(p))) >= 225; }
+
+    /** Заливка: возвращает метки компонент (1..n), 0 = фон. */
+    static int[] label(boolean[] m, int w, int h) {
+        int[] lab = new int[w * h];
+        int[] stack = new int[w * h];
+        int n = 0;
+        for (int i = 0; i < w * h; i++) {
+            if (!m[i] || lab[i] != 0) continue;
+            n++;
+            int sp = 0; stack[sp++] = i; lab[i] = n;
+            while (sp > 0) {
+                int q = stack[--sp];
+                int x = q % w, y = q / w;
+                if (x > 0 && m[q - 1] && lab[q - 1] == 0) { lab[q - 1] = n; stack[sp++] = q - 1; }
+                if (x < w - 1 && m[q + 1] && lab[q + 1] == 0) { lab[q + 1] = n; stack[sp++] = q + 1; }
+                if (y > 0 && m[q - w] && lab[q - w] == 0) { lab[q - w] = n; stack[sp++] = q - w; }
+                if (y < h - 1 && m[q + w] && lab[q + w] == 0) { lab[q + w] = n; stack[sp++] = q + w; }
+            }
+        }
+        return lab;
+    }
+
+    static boolean[] erode(boolean[] m, int w, int h, int e) {
+        boolean[] a = new boolean[w * h], o = new boolean[w * h];
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            boolean ok = true;
+            for (int k = -e; k <= e && ok; k++) { int xx = x + k; if (xx < 0 || xx >= w || !m[y * w + xx]) ok = false; }
+            a[y * w + x] = ok;
+        }
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            boolean ok = true;
+            for (int k = -e; k <= e && ok; k++) { int yy = y + k; if (yy < 0 || yy >= h || !a[yy * w + x]) ok = false; }
+            o[y * w + x] = ok;
+        }
+        return o;
+    }
+
+    public static Result detect(int[] px, int w, int h) {
+        Result res = new Result();
+        float[] t = new float[3];
+
+        // 1. Цвет сукна: самый частый оттенок в центре экрана
+        int[] hist = new int[72];
+        int cxs = w / 2, cys = h / 2, cnt0 = 0;
+        for (int y = cys - 60; y <= cys + 60; y += 2) for (int x = cxs - 120; x <= cxs + 120; x += 2) {
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            hsv(px[y * w + x], t);
+            if (t[1] > 0.35f && t[2] > 0.30f) { hist[((int) (t[0] / 5f)) % 72]++; cnt0++; }
+        }
+        if (cnt0 < 200) { res.msg = "Не вижу сукно по центру экрана. Откройте игру со столом."; return res; }
+        int bi = 0, bv = -1;
+        for (int i = 0; i < 72; i++) {
+            int v = hist[i] * 2 + hist[(i + 71) % 72] + hist[(i + 1) % 72];
+            if (v > bv) { bv = v; bi = i; }
+        }
+        float h0 = bi * 5f + 2.5f;
+
+        // 2. Стол: самая большая область цвета сукна (в половинном разрешении)
+        int mw = w / 2, mh = h / 2;
+        boolean[] cm = new boolean[mw * mh];
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) cm[y * mw + x] = cloth(px[(y * 2) * w + x * 2], h0, t);
+        int[] lab = label(cm, mw, mh);
+        int best = -1, bestCnt = 0;
+        int nlab = 0;
+        for (int v : lab) if (v > nlab) nlab = v;
+        int[] cnt = new int[nlab + 1]; int[] bx0 = new int[nlab + 1], bx1 = new int[nlab + 1], by0 = new int[nlab + 1], by1 = new int[nlab + 1];
+        for (int i = 1; i <= nlab; i++) { bx0[i] = mw; by0[i] = mh; bx1[i] = -1; by1[i] = -1; }
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
+            int v = lab[y * mw + x]; if (v == 0) continue;
+            cnt[v]++; if (x < bx0[v]) bx0[v] = x; if (x > bx1[v]) bx1[v] = x; if (y < by0[v]) by0[v] = y; if (y > by1[v]) by1[v] = y;
+        }
+        for (int i = 1; i <= nlab; i++) if (cnt[i] > bestCnt) { bestCnt = cnt[i]; best = i; }
+        if (best < 0) { res.msg = "Стол не найден."; return res; }
+        int oL = bx0[best] * 2, oR = bx1[best] * 2 + 1, oT = by0[best] * 2, oB = by1[best] * 2 + 1;
+        float ow = oR - oL, oh = oB - oT;
+        if (ow < w * 0.35f || ow / oh < 1.3f || ow / oh > 2.6f) { res.msg = "Стол найден неверно. Откройте игру на весь экран (альбомная ориентация)."; return res; }
+        int k = Math.round(0.0191f * ow); // ширина бортовой полосы
+        res.l = oL + k; res.rr = oR - k; res.t = oT + k; res.b = oB - k;
+        float il = res.l, ir = res.rr, it = res.t, ib = res.b;
+        float r0 = 0.0151f * (ir - il);
+
+        // 3. Биток: белое круглое пятно. Считаем долю «белых» пикселей в квадрате по интегральному изображению.
+        int W1 = w + 1;
+        int[] ii = new int[W1 * (h + 1)];
+        for (int y = 0; y < h; y++) {
+            int row = 0;
+            for (int x = 0; x < w; x++) {
+                if (whiteish(px[y * w + x])) row++;
+                ii[(y + 1) * W1 + x + 1] = ii[y * W1 + x + 1] + row;
+            }
+        }
+        int hw = Math.round(0.62f * r0);
+        // кандидаты в биток: лучшие места по доле белого (с подавлением соседей)
+        int K = 8;
+        double[] cf = new double[K]; int[] cxs2 = new int[K], cys2 = new int[K]; int nc = 0;
+        for (int y = (int) it + hw; y <= (int) ib - hw; y += 3) {
+            for (int x = (int) il + hw; x <= (int) ir - hw; x += 3) {
+                int sum = ii[(y + hw + 1) * W1 + x + hw + 1] - ii[(y - hw) * W1 + x + hw + 1] - ii[(y + hw + 1) * W1 + x - hw] + ii[(y - hw) * W1 + x - hw];
+                double fr = sum / (double) ((2 * hw + 1) * (2 * hw + 1));
+                if (fr < 0.60) continue;
+                int near = -1;
+                for (int i = 0; i < nc; i++) { double ddx = cxs2[i] - x, ddy = cys2[i] - y; if (ddx * ddx + ddy * ddy < 1.5 * 1.5 * r0 * r0) { near = i; break; } }
+                if (near >= 0) { if (fr > cf[near]) { cf[near] = fr; cxs2[near] = x; cys2[near] = y; } }
+                else if (nc < K) { cf[nc] = fr; cxs2[nc] = x; cys2[nc] = y; nc++; }
+                else { int mi = 0; for (int i = 1; i < K; i++) if (cf[i] < cf[mi]) mi = i; if (fr > cf[mi]) { cf[mi] = fr; cxs2[mi] = x; cys2[mi] = y; } }
+            }
+        }
+        if (nc == 0) { res.msg = "Не вижу белый шар (биток)."; return res; }
+        float r = r0;
+        res.r = r;
+        double[] bestFit = null; double bestLen = 0;
+        for (int ci = 0; ci < nc; ci++) {
+            float cx = cxs2[ci], cy = cys2[ci];
+            for (int iter = 0; iter < 3; iter++) {
+                double sx = 0, sy = 0; int n = 0;
+                int rr0 = Math.round(0.95f * r0);
+                for (int y = Math.round(cy) - rr0; y <= Math.round(cy) + rr0; y++) for (int x = Math.round(cx) - rr0; x <= Math.round(cx) + rr0; x++) {
+                    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                    if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > rr0 * rr0) continue;
+                    if (whiteish(px[y * w + x])) { sx += x; sy += y; n++; }
+                }
+                if (n > 20) { cx = (float) (sx / n); cy = (float) (sy / n); }
+            }
+            double[] fit = aimFrom(px, w, h, cx, cy, r, ow + 40);
+            if (DEBUG) System.out.printf("[dbg] кандидат %d: (%.0f,%.0f) белое=%.2f длина линии=%.0f%n", ci, cx, cy, cf[ci], fit == null ? 0 : fit[0]);
+            if (fit != null && fit[0] > bestLen) { bestLen = fit[0]; bestFit = fit; }
+        }
+        if (bestFit == null || bestLen < 3 * r) { res.msg = "Не вижу линию прицела игры. Наведите кий на шар, чтобы игра показала линию."; return res; }
+        res.cx = (float) bestFit[2]; res.cy = (float) bestFit[3];
+        double ang = bestFit[1];
+        double dx = Math.cos(ang), dy = Math.sin(ang);
+        // линия игры заканчивается в центре «призрачного» битка
+        res.ax = (float) bestFit[4]; res.ay = (float) bestFit[5];
+        if (DEBUG) System.out.printf("[dbg] угол=%.2f° длина линии=%.0f%n", Math.toDegrees(ang), bestLen);
+
+        // 5. Шар, в который целимся: касается «призрачного» битка (расстояние 2r), в стороне удара
+        double bestScore = -1, bestDelta = 9, bestPhi = 0;
+        for (double dphi = -100; dphi <= 100; dphi += 1.5) {
+            double phi = ang + Math.toRadians(dphi);
+            float pxc = (float) (res.ax + 2 * r * Math.cos(phi)), pyc = (float) (res.ay + 2 * r * Math.sin(phi));
+            if (pxc < il - 4 || pxc > ir + 4 || pyc < it - 4 || pyc > ib + 4) continue;
+            double sc = diskNonCloth(px, w, h, pxc, pyc, 0.75f * r, h0, t);
+            double dl = Math.abs(dphi);
+            if (sc > bestScore + 0.01 || (Math.abs(sc - bestScore) <= 0.01 && dl < bestDelta)) { bestScore = sc; bestDelta = dl; bestPhi = phi; }
+        }
+        if (bestScore >= 0.85) {
+            float pxc = (float) (res.ax + 2 * r * Math.cos(bestPhi)), pyc = (float) (res.ay + 2 * r * Math.sin(bestPhi));
+            // уточнение: среднее по «плато» вокруг найденной точки
+            double sx = 0, sy = 0; int n = 0;
+            double maxSc = 0;
+            for (int oy = -6; oy <= 6; oy += 2) for (int ox = -6; ox <= 6; ox += 2) {
+                double sc = diskNonCloth(px, w, h, pxc + ox, pyc + oy, 0.75f * r, h0, t);
+                if (sc > maxSc) maxSc = sc;
+            }
+            for (int oy = -6; oy <= 6; oy += 2) for (int ox = -6; ox <= 6; ox += 2) {
+                double sc = diskNonCloth(px, w, h, pxc + ox, pyc + oy, 0.75f * r, h0, t);
+                if (sc >= maxSc - 0.02) { sx += pxc + ox; sy += pyc + oy; n++; }
+            }
+            res.hasObj = true; res.ox = (float) (sx / n); res.oy = (float) (sy / n);
+        }
+        res.ok = true;
+        res.msg = res.hasObj ? "Готово: стол, биток, прицел и шар найдены." : "Стол, биток и прицел найдены. Шар на линии не найден (линия идёт в борт).";
+        return res;
+    }
+
+    /** Ищет белую линию прицела, выходящую из точки (cx,cy). Возвращает {длина, угол, cx', cy', конецX, конецY} или null. */
+    static double[] aimFrom(int[] px, int w, int h, float cx, float cy, float r, double maxT) {
+        float t0 = 1.25f * r;
+        double bestL = 0, bestA = 0;
+        int steps = 2400;
+        double[] Ls = new double[steps];
+        for (int s = 0; s < steps; s++) {
+            double a = 2 * Math.PI * s / steps, ca = Math.cos(a), sa = Math.sin(a);
+            double L = rayRun(px, w, h, cx, cy, ca, sa, t0, maxT);
+            Ls[s] = L;
+            if (L > bestL) { bestL = L; bestA = a; }
+        }
+        if (bestL < 3 * r) return null;
+        double sumA = 0; int nA = 0;
+        for (int s = 0; s < steps; s++) {
+            if (Ls[s] >= bestL * 0.97) {
+                double a = 2 * Math.PI * s / steps;
+                double d = a - bestA; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI;
+                if (Math.abs(d) < 0.03) { sumA += d; nA++; }
+            }
+        }
+        double ang = bestA + (nA > 0 ? sumA / nA : 0);
+        double dx0 = Math.cos(ang), dy0 = Math.sin(ang), nx0 = -dy0, ny0 = dx0;
+        double sT = 0, sO = 0, sTT = 0, sTO = 0; int m = 0;
+        for (double tt = t0 + 6; tt <= t0 + bestL - 6; tt += 6) {
+            double so = 0; int c = 0;
+            for (int o = -7; o <= 7; o++) {
+                int x = (int) Math.round(cx + dx0 * tt + nx0 * o), y = (int) Math.round(cy + dy0 * tt + ny0 * o);
+                if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                if (line(px[y * w + x])) { so += o; c++; }
+            }
+            if (c >= 1 && c <= 9) { double off = so / c; sT += tt; sO += off; sTT += tt * tt; sTO += tt * off; m++; }
+        }
+        double ncx = cx, ncy = cy;
+        if (m >= 4) {
+            double den = m * sTT - sT * sT;
+            if (Math.abs(den) > 1e-6) {
+                double bsl = (m * sTO - sT * sO) / den, a0 = (sO - bsl * sT) / m;
+                ang += Math.atan(bsl);
+                ncx += nx0 * a0; ncy += ny0 * a0;
+            }
+        }
+        double dx = Math.cos(ang), dy = Math.sin(ang);
+        double tEnd = t0 + bestL;
+        return new double[]{bestL, ang, ncx, ncy, ncx + dx * tEnd, ncy + dy * tEnd};
+    }
+
+    static double rayRun(int[] px, int w, int h, float cx, float cy, double ca, double sa, float t0, double maxT) {
+        // линия должна начинаться сразу у t0
+        if (!lineAt(px, w, h, cx, cy, ca, sa, t0) || !lineAt(px, w, h, cx, cy, ca, sa, t0 + 8)) return 0;
+        double last = t0; int gap = 0;
+        for (double tt = t0; tt < maxT; tt += 1) {
+            if (lineAt(px, w, h, cx, cy, ca, sa, tt)) { last = tt; gap = 0; }
+            else if (++gap > 3) break;
+        }
+        return last - t0;
+    }
+
+    static boolean lineAt(int[] px, int w, int h, float cx, float cy, double ca, double sa, double tt) {
+        int x = (int) Math.round(cx + ca * tt), y = (int) Math.round(cy + sa * tt);
+        if (x < 0 || y < 0 || x >= w || y >= h) return false;
+        return line(px[y * w + x]);
+    }
+
+    static double diskNonCloth(int[] px, int w, int h, float cx, float cy, float rad, float h0, float[] t) {
+        int tot = 0, non = 0;
+        for (float y = -rad; y <= rad; y += 2) for (float x = -rad; x <= rad; x += 2) {
+            if (x * x + y * y > rad * rad) continue;
+            int xx = Math.round(cx + x), yy = Math.round(cy + y);
+            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+            tot++;
+            if (!cloth(px[yy * w + xx], h0, t)) non++;
+        }
+        return tot == 0 ? 0 : non / (double) tot;
     }
 }

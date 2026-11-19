@@ -3,6 +3,7 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application android:label="Линейка прицела" android:icon="@android:drawable/ic_menu_compass"
         android:theme="@android:style/Theme.Material.NoActionBar">
@@ -12,7 +13,7 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        <service android:name=".OverlayService" android:exported="false" android:foregroundServiceType="specialUse">
+        <service android:name=".OverlayService" android:exported="false" android:foregroundServiceType="specialUse|mediaProjection">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="aim_overlay"/>
         </service>
     </application>
