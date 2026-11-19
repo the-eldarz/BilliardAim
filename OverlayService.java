@@ -52,6 +52,8 @@ public class OverlayService extends Service {
     float[] bX = new float[0], bY = new float[0];
     ImageReader stream;
     Runnable watch;
+    Vision.Result pend;               // «скачок» результата ждёт подтверждения следующим кадром
+    final Runnable acceptRun = new Runnable() { @Override public void run() { acceptPendNow(); } };
     MediaProjection proj;
     VirtualDisplay vd;
     final Handler ui = new Handler(Looper.getMainLooper());
@@ -244,26 +246,64 @@ public class OverlayService extends Service {
         }).start();
     }
 
+    void apply(Vision.Result res) {
+        have = true;
+        sTL = res.l; sTT = res.t; sBR = res.rr; sBB = res.b; sR = res.r;
+        cX = res.cx; cY = res.cy; aX = res.ax; aY = res.ay;
+        int n = res.nb + (res.hasObj ? 1 : 0);
+        float[] nx = new float[n], ny = new float[n]; int k = 0;
+        for (int i = 0; i < res.nb; i++) { nx[k] = res.bx[i]; ny[k] = res.by[i]; k++; }
+        if (res.hasObj) {
+            boolean dup = false;
+            for (int i = 0; i < res.nb; i++) if (Math.hypot(res.bx[i] - res.ox, res.by[i] - res.oy) < 0.7f * res.r) { dup = true; nx[i] = res.ox; ny[i] = res.oy; }
+            if (!dup) { nx[k] = res.ox; ny[k] = res.oy; k++; }
+        }
+        bX = java.util.Arrays.copyOf(nx, k); bY = java.util.Arrays.copyOf(ny, k);
+    }
+
+    void acceptPendNow() {
+        Vision.Result p = pend; pend = null;
+        if (p == null || wm == null) return;
+        apply(p);
+        lines.invalidate();
+    }
+
+    // Новый результат сильно отличается от прежнего (биток сдвинулся или линия резко повернулась)?
+    boolean jumped(Vision.Result n) {
+        if (Math.hypot(n.cx - cX, n.cy - cY) > 0.8f * sR) return true;
+        double a0 = Math.atan2(aY - cY, aX - cX), a1 = Math.atan2(n.ay - n.cy, n.ax - n.cx);
+        double dd = Math.abs(a1 - a0);
+        if (dd > Math.PI) dd = 2 * Math.PI - dd;
+        return Math.toDegrees(dd) > 10;
+    }
+
     void finishScan(Vision.Result res) {
         busy = false;
         if (wm == null) return;
         if (res != null && res.ok) {
-            have = true; failStreak = 0;
-            sTL = res.l; sTT = res.t; sBR = res.rr; sBB = res.b; sR = res.r;
-            cX = res.cx; cY = res.cy; aX = res.ax; aY = res.ay;
-            int n = res.nb + (res.hasObj ? 1 : 0);
-            float[] nx = new float[n], ny = new float[n]; int k = 0;
-            for (int i = 0; i < res.nb; i++) { nx[k] = res.bx[i]; ny[k] = res.by[i]; k++; }
-            if (res.hasObj) {
-                boolean dup = false;
-                for (int i = 0; i < res.nb; i++) if (Math.hypot(res.bx[i] - res.ox, res.by[i] - res.oy) < 0.7f * res.r) { dup = true; nx[i] = res.ox; ny[i] = res.oy; }
-                if (!dup) { nx[k] = res.ox; ny[k] = res.oy; k++; }
+            failStreak = 0;
+            if (mode == 2 && have && jumped(res)) {
+                // Резкий скачок может быть сбоем распознавания одного кадра.
+                // Если следующий кадр тоже такой же «скачок» (или кадров больше нет 0.45 с) — принимаем.
+                if (pend != null) { pend = null; ui.removeCallbacks(acceptRun); apply(res); }
+                else { pend = res; ui.postDelayed(acceptRun, 450); }
+            } else {
+                pend = null; ui.removeCallbacks(acceptRun);
+                apply(res);
             }
-            bX = java.util.Arrays.copyOf(nx, k); bY = java.util.Arrays.copyOf(ny, k);
         } else {
-            failStreak++;
-            if (mode == 1) { toast(res == null ? "Не удалось обработать кадр экрана." : res.msg); }
-            if (mode == 1 || failStreak >= 3) have = false;
+            if (mode == 1) {
+                toast(res == null ? "Не удалось обработать кадр экрана." : res.msg);
+                have = false;
+            } else if (have) {
+                // Игра может прятать свою линию, пока вы не касаетесь экрана. Если биток стоит на месте —
+                // значит, вы просто думаете: оставляем последний прицел как есть.
+                boolean same = res != null && res.cueOk && Math.hypot(res.cx - cX, res.cy - cY) < 0.6f * sR;
+                if (same) failStreak = 0;
+                else if (++failStreak >= 3) { have = false; pend = null; ui.removeCallbacks(acceptRun); }
+            } else {
+                failStreak++;
+            }
         }
         lines.invalidate();
     }
@@ -497,6 +537,7 @@ public class OverlayService extends Service {
 class Vision {
     public static class Result {
         public boolean ok;
+        public boolean tableOk, cueOk;        // стол найден / биток найден (даже если линии прицела игры сейчас нет)
         public String msg = "";
         public float l, t, rr, b, r;          // внутренняя область сукна и радиус шара (пиксели экрана)
         public float cx, cy;                  // биток
@@ -619,6 +660,8 @@ class Vision {
         res.l = oL + k; res.rr = oR - k; res.t = oT + k; res.b = oB - k;
         float il = res.l, ir = res.rr, it = res.t, ib = res.b;
         float r0 = 0.0151f * (ir - il);
+        res.tableOk = true;
+        res.l = il; res.rr = ir; res.t = it; res.b = ib; res.r = r0;
 
         // 3. Биток: белое круглое пятно. Считаем долю «белых» пикселей в квадрате по интегральному изображению.
         int W1 = w + 1;
@@ -650,6 +693,7 @@ class Vision {
         float r = r0;
         res.r = r;
         double[] bestFit = null; double bestLen = 0;
+        double bestWhite = 0; float wx = 0, wy = 0;
         for (int ci = 0; ci < nc; ci++) {
             float cx = cxs2[ci], cy = cys2[ci];
             for (int iter = 0; iter < 3; iter++) {
@@ -662,11 +706,16 @@ class Vision {
                 }
                 if (n > 20) { cx = (float) (sx / n); cy = (float) (sy / n); }
             }
+            if (cf[ci] > bestWhite) { bestWhite = cf[ci]; wx = cx; wy = cy; }
             double[] fit = aimFrom(px, w, h, cx, cy, r, ow + 40);
             if (DEBUG) System.out.printf("[dbg] кандидат %d: (%.0f,%.0f) белое=%.2f длина линии=%.0f%n", ci, cx, cy, cf[ci], fit == null ? 0 : fit[0]);
             if (fit != null && fit[0] > bestLen) { bestLen = fit[0]; bestFit = fit; }
         }
-        if (bestFit == null || bestLen < 3 * r) { res.msg = "Не вижу линию прицела игры. Наведите кий на шар, чтобы игра показала линию."; return res; }
+        if (bestFit == null || bestLen < 3 * r) {
+            if (bestWhite >= 0.65) { res.cueOk = true; res.cx = wx; res.cy = wy; }
+            res.msg = "Не вижу линию прицела игры. Наведите кий на шар, чтобы игра показала линию.";
+            return res;
+        }
         res.cx = (float) bestFit[2]; res.cy = (float) bestFit[3];
         double ang = bestFit[1];
         double dx = Math.cos(ang), dy = Math.sin(ang);
