@@ -187,7 +187,11 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
         if (prefs().getInt(KEY_MODE, 0) != 0) {
             MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-            startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE);
+            // На Android 14+ просим только «весь экран»: системное меню выбора приложения не показывается
+            Intent ci = Build.VERSION.SDK_INT >= 34
+                ? mpm.createScreenCaptureIntent(android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay())
+                : mpm.createScreenCaptureIntent();
+            startActivityForResult(ci, REQ_CAPTURE);
             return;
         }
         startOverlay(0, 0, null);
@@ -200,7 +204,20 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
         OverlayService.running = true;
         refresh();
-        moveTaskToBack(true);
+        if (!launchGame()) moveTaskToBack(true);
+    }
+
+    static final String[] GAME_PKGS = {"com.miniclip.eightballpool"};
+
+    // Сразу открываем 8 Ball Pool после включения линейки
+    boolean launchGame() {
+        for (String pkg : GAME_PKGS) {
+            Intent li = getPackageManager().getLaunchIntentForPackage(pkg);
+            if (li == null) continue;
+            li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try { startActivity(li); return true; } catch (Exception e) { /* пробуем дальше */ }
+        }
+        return false;
     }
 
     @Override protected void onActivityResult(int req, int res, Intent data) {
