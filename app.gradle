@@ -6,8 +6,18 @@ android {
         applicationId 'com.aimruler'
         minSdk 24
         targetSdk 34
-        versionCode 1
+        // номер версии растёт с каждой сборкой, чтобы Android принимал обновление поверх старой версии
+        versionCode (System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger()
         versionName '1.0'
+    }
+    // Одна и та же подпись при каждой сборке: тогда APK ставится как обновление, без удаления старой версии
+    signingConfigs {
+        debug {
+            storeFile file('aim.keystore')
+            storePassword 'aimruler'
+            keyAlias 'aim'
+            keyPassword 'aimruler'
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
