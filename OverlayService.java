@@ -52,6 +52,7 @@ public class OverlayService extends Service {
     float[] bX = new float[0], bY = new float[0];
     ImageReader stream;
     Runnable watch;
+    String lastMsg;                   // почему сейчас нет прицела (для автоскана)
     Vision.Result pend;               // «скачок» результата ждёт подтверждения следующим кадром
     final Runnable acceptRun = new Runnable() { @Override public void run() { acceptPendNow(); } };
     MediaProjection proj;
@@ -254,9 +255,17 @@ public class OverlayService extends Service {
         float[] nx = new float[n], ny = new float[n]; int k = 0;
         for (int i = 0; i < res.nb; i++) { nx[k] = res.bx[i]; ny[k] = res.by[i]; k++; }
         if (res.hasObj) {
-            boolean dup = false;
-            for (int i = 0; i < res.nb; i++) if (Math.hypot(res.bx[i] - res.ox, res.by[i] - res.oy) < 0.7f * res.r) { dup = true; nx[i] = res.ox; ny[i] = res.oy; }
-            if (!dup) { nx[k] = res.ox; ny[k] = res.oy; k++; }
+            // Шар-цель: берём центр из общего поиска шаров (он точнее грубой оценки у «призрака»)
+            int di = -1; double dBest = 0.7f * res.r;
+            for (int i = 0; i < res.nb; i++) {
+                double dd = Math.hypot(res.bx[i] - res.ox, res.by[i] - res.oy);
+                if (dd < dBest) { dBest = dd; di = i; }
+            }
+            if (di >= 0) {
+                // Расстояние «призрак» -> шар задаёт реальную дистанцию касания игры (2R): подгоняем радиус
+                double dist = Math.hypot(nx[di] - res.ax, ny[di] - res.ay);
+                sR = (float) Math.max(0.88f * res.r, Math.min(1.06f * res.r, dist / 2));
+            } else { nx[k] = res.ox; ny[k] = res.oy; k++; }
         }
         bX = java.util.Arrays.copyOf(nx, k); bY = java.util.Arrays.copyOf(ny, k);
     }
@@ -280,6 +289,7 @@ public class OverlayService extends Service {
     void finishScan(Vision.Result res) {
         busy = false;
         if (wm == null) return;
+        lastMsg = (res == null || res.ok) ? null : res.msg;
         if (res != null && res.ok) {
             failStreak = 0;
             if (mode == 2 && have && jumped(res)) {
@@ -432,6 +442,7 @@ public class OverlayService extends Service {
             tx.setTextAlign(Paint.Align.CENTER); tx.setTextSize(18 * d); tx.setShadowLayer(4 * d, 0, 0, 0xFF000000);
             if (!have) {
                 if (mode == 1) { tx.setColor(0xFFFFFFFF); c.drawText("Прицельтесь и нажмите «Скан»", getWidth() / 2f, 40 * d, tx); }
+                else if (mode == 2 && lastMsg != null) { tx.setColor(0xFFFFD54F); tx.setTextSize(14 * d); c.drawText(lastMsg, getWidth() / 2f, 40 * d, tx); }
                 return;
             }
             float R = sR;
@@ -567,7 +578,24 @@ class Vision {
         o[0] = h; o[1] = mx == 0 ? 0 : d / mx; o[2] = mx;
     }
 
+    // 0 = сукно ищем по оттенку (цветные столы), 1 = по близости к основному цвету (серые, чёрные, бледные столы)
+    static int clothMode = 0;
+    static float refR, refG, refB, refV;
+
+    static int med(int[] c, int tot) {
+        int acc = 0;
+        for (int i = 0; i < c.length; i++) { acc += c[i]; if (acc * 2 >= tot) return i; }
+        return 0;
+    }
+
     static boolean cloth(int p, float h0, float[] t) {
+        if (clothMode == 1) {
+            int r = R(p), g = G(p), b = B(p);
+            float v = Math.max(r, Math.max(g, b));
+            if (v < refV * 0.55f || v > refV * 1.45f) return false;
+            float sc = refV / Math.max(1f, v);
+            return Math.abs(r * sc - refR) + Math.abs(g * sc - refG) + Math.abs(b * sc - refB) <= 60f;
+        }
         hsv(p, t);
         float dh = Math.abs(t[0] - h0);
         if (dh > 180) dh = 360 - dh;
@@ -618,6 +646,17 @@ class Vision {
     }
 
     public static Result detect(int[] px, int w, int h) {
+        clothMode = 0;
+        Result r1 = detectImpl(px, w, h);
+        if (r1.tableOk) return r1;
+        clothMode = 1;   // запасной вариант: серое, тёмное или бледное сукно
+        Result r2 = detectImpl(px, w, h);
+        if (r2.tableOk) return r2;
+        clothMode = 0;
+        return r1;
+    }
+
+    static Result detectImpl(int[] px, int w, int h) {
         Result res = new Result();
         float[] t = new float[3];
 
@@ -629,13 +668,28 @@ class Vision {
             hsv(px[y * w + x], t);
             if (t[1] > 0.35f && t[2] > 0.30f) { hist[((int) (t[0] / 5f)) % 72]++; cnt0++; }
         }
-        if (cnt0 < 200) { res.msg = "Не вижу сукно по центру экрана. Откройте игру со столом."; return res; }
-        int bi = 0, bv = -1;
-        for (int i = 0; i < 72; i++) {
-            int v = hist[i] * 2 + hist[(i + 71) % 72] + hist[(i + 1) % 72];
-            if (v > bv) { bv = v; bi = i; }
+        float h0;
+        if (clothMode == 1) {
+            int[] qr = new int[256], qg = new int[256], qb = new int[256]; int tot = 0;
+            for (int y = cys - 60; y <= cys + 60; y += 2) for (int x = cxs - 120; x <= cxs + 120; x += 2) {
+                if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                int pp = px[y * w + x];
+                qr[R(pp)]++; qg[G(pp)]++; qb[B(pp)]++; tot++;
+            }
+            if (tot < 200) { res.msg = "Не вижу сукно по центру экрана."; return res; }
+            refR = med(qr, tot); refG = med(qg, tot); refB = med(qb, tot);
+            refV = Math.max(refR, Math.max(refG, refB));
+            if (refV < 20) { res.msg = "Сукно слишком тёмное для распознавания."; return res; }
+            h0 = 0;
+        } else {
+            if (cnt0 < 200) { res.msg = "Не вижу сукно по центру экрана. Откройте игру со столом."; return res; }
+            int bi = 0, bv = -1;
+            for (int i = 0; i < 72; i++) {
+                int v = hist[i] * 2 + hist[(i + 71) % 72] + hist[(i + 1) % 72];
+                if (v > bv) { bv = v; bi = i; }
+            }
+            h0 = bi * 5f + 2.5f;
         }
-        float h0 = bi * 5f + 2.5f;
 
         // 2. Стол: самая большая область цвета сукна (в половинном разрешении)
         int mw = w / 2, mh = h / 2;
