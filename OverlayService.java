@@ -53,6 +53,13 @@ public class OverlayService extends Service {
     ImageReader stream;
     Runnable watch;
     String lastMsg;                   // почему сейчас нет прицела (для автоскана)
+    // --- подсказка и Lucky Shot (только автоскан) ---
+    boolean hintOn, luckyOn, planning;
+    int group;                        // какие шары мои: 0 любые, 1 целые, 2 полосатые
+    Planner.Hint curHint; Planner.Lucky curLucky;
+    Vision.Result planRes;            // кадр, по которому построен план
+    String planMsg;
+    long lastSig, planSig; int stable;
     Vision.Result pend;               // «скачок» результата ждёт подтверждения следующим кадром
     final Runnable acceptRun = new Runnable() { @Override public void run() { acceptPendNow(); } };
     MediaProjection proj;
@@ -145,6 +152,35 @@ public class OverlayService extends Service {
         if (mode == 1) { Button bA = btn("Скан"); bA.setOnClickListener(v -> scan()); panel.addView(bA); }
         panel.addView(bB);
         if (mode == 0) { panel.addView(bM); panel.addView(bP); }
+        if (mode == 2) {
+            final android.content.SharedPreferences sp = getSharedPreferences("aim", MODE_PRIVATE);
+            Planner.L0MAX = sp.getFloat("l0max", 6000f);
+            final Button bH = btn("Подсказка: выкл");
+            bH.setOnClickListener(v -> {
+                hintOn = !hintOn; bH.setText(hintOn ? "Подсказка: вкл" : "Подсказка: выкл");
+                curHint = null; planSig = 0; stable = 0; lines.invalidate();
+            });
+            final Button bL = btn("Lucky: выкл");
+            bL.setOnClickListener(v -> {
+                luckyOn = !luckyOn; bL.setText(luckyOn ? "Lucky: вкл" : "Lucky: выкл");
+                curLucky = null; planSig = 0; stable = 0; lines.invalidate();
+            });
+            final Button bG = btn("Шары: любые");
+            bG.setOnClickListener(v -> {
+                group = (group + 1) % 3; bG.setText(group == 0 ? "Шары: любые" : group == 1 ? "Шары: целые" : "Шары: полосатые");
+                curHint = null; planSig = 0; stable = 0; lines.invalidate();
+            });
+            // Калибровка силы: «Сила+» показывает нужную силу больше, «Сила-» меньше
+            Button bSu = btn("Сила+"); bSu.setOnClickListener(v -> {
+                Planner.L0MAX *= 0.92f; sp.edit().putFloat("l0max", Planner.L0MAX).apply(); curHint = null; curLucky = null; planSig = 0; stable = 0;
+                Toast.makeText(this, "Нужная сила в подсказках стала больше", Toast.LENGTH_SHORT).show(); lines.invalidate();
+            });
+            Button bSd = btn("Сила-"); bSd.setOnClickListener(v -> {
+                Planner.L0MAX /= 0.92f; sp.edit().putFloat("l0max", Planner.L0MAX).apply(); curHint = null; curLucky = null; planSig = 0; stable = 0;
+                Toast.makeText(this, "Нужная сила в подсказках стала меньше", Toast.LENGTH_SHORT).show(); lines.invalidate();
+            });
+            panel.addView(bH); panel.addView(bG); panel.addView(bL); panel.addView(bSd); panel.addView(bSu);
+        }
         panel.addView(bS); panel.addView(bX);
         LayoutParams pp = new LayoutParams(-2, -2, type(), LayoutParams.FLAG_NOT_FOCUSABLE | LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT);
         pp.gravity = Gravity.BOTTOM | Gravity.LEFT;
@@ -286,9 +322,56 @@ public class OverlayService extends Service {
         return Math.toDegrees(dd) > 10;
     }
 
+    long sigOf(Vision.Result r) {
+        long h = Math.round(r.cx / 5f) * 73856093L ^ Math.round(r.cy / 5f) * 19349663L;
+        for (int i = 0; i < r.nb; i++) h += (Math.round(r.bx[i] / 5f) * 73856093L) ^ (Math.round(r.by[i] / 5f) * 19349663L) * 31L;
+        return h * 1000003L + r.nb;
+    }
+
+    // Подсказка и Lucky Shot считаем, когда шары стоят (два одинаковых кадра подряд), в фоне
+    void maybePlan(Vision.Result res) {
+        if (mode != 2 || (!hintOn && !luckyOn)) return;
+        if (res == null || !res.tableOk || !res.cueOk || res.nb < 1) return;
+        long sig = sigOf(res);
+        if (sig != lastSig) {
+            lastSig = sig; stable = 0;
+            if (sig != planSig) { curHint = null; curLucky = null; planMsg = null; lines.invalidate(); }
+            return;
+        }
+        stable++;
+        if (stable < 1 || sig == planSig || planning) return;
+        planning = true;
+        final Vision.Result rs = res; final boolean doL = luckyOn, doH = hintOn; final int grp = group; final long fsig = sig;
+        new Thread(() -> {
+            Planner.Hint hh = null; Planner.Lucky ll = null; String msg = null;
+            try {
+                Planner.World wd = new Planner.World(rs);
+                if (doL) {
+                    int gi = -1;
+                    for (int i = 0; i < rs.nb; i++) if (rs.gold[i]) gi = i;
+                    if (rs.hasTarget && gi >= 0) ll = Planner.lucky(wd, rs.cx, rs.cy, rs.bx, rs.by, gi, rs.tx, rs.ty, 2500);
+                    else msg = "Lucky Shot: не вижу мишень или золотой шар";
+                }
+                if (doH && ll == null && !(doL && rs.hasTarget)) {
+                    if (!rs.myTurn) msg = "Подсказка: сейчас ход соперника";
+                    else {
+                        hh = Planner.hint(wd, rs.cx, rs.cy, rs.bx, rs.by, rs.bt, grp);
+                        if (hh == null) msg = "Подсказка: подходящих ударов не нашла";
+                    }
+                }
+            } catch (Throwable e) { msg = "Ошибка расчёта удара"; }
+            final Planner.Hint fh = hh; final Planner.Lucky fl = ll; final String fm = msg;
+            ui.post(() -> {
+                planning = false; planSig = fsig; planRes = rs; curHint = fh; curLucky = fl; planMsg = fm;
+                if (lines != null) lines.invalidate();
+            });
+        }).start();
+    }
+
     void finishScan(Vision.Result res) {
         busy = false;
         if (wm == null) return;
+        maybePlan(res);
         lastMsg = (res == null || res.ok) ? null : res.msg;
         if (res != null && res.ok) {
             failStreak = 0;
@@ -437,7 +520,74 @@ public class OverlayService extends Service {
             for (int i = 0; i < pts.size(); i++) { float[] a = pts.get(i); if (i == 0) q.moveTo(a[0], a[1]); else q.lineTo(a[0], a[1]); }
             return q;
         }
+        void tick(Canvas c, float frac, float sx, float sy, int col) {
+            // шкала силы слева: 0% сверху, 100% снизу (в разметке экрана 2400x1080)
+            float y = (345f + frac * 550f) * sy;
+            p.setPathEffect(null); p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(4 * d); p.setColor(col);
+            c.drawLine(150 * sx, y, 266 * sx, y, p);
+            tx.setColor(col); tx.setTextAlign(Paint.Align.LEFT); tx.setTextSize(16 * d);
+            c.drawText(Math.round(frac * 100) + "%", 276 * sx, y + 6 * d, tx);
+            tx.setTextAlign(Paint.Align.CENTER);
+        }
+
+        String turnText(float planAng) {
+            if (!have) return "";
+            double cur = Math.atan2(aY - cY, aX - cX), dd = planAng - cur;
+            while (dd > Math.PI) dd -= 2 * Math.PI;
+            while (dd < -Math.PI) dd += 2 * Math.PI;
+            double deg = Math.toDegrees(dd);
+            if (Math.abs(deg) < 0.3) return " · угол совпал";
+            return String.format(java.util.Locale.US, " · довернуть %s на %.1f°", deg > 0 ? "по часовой" : "против часовой", Math.abs(deg));
+        }
+
+        void drawPlan(Canvas c) {
+            if (mode != 2 || (!hintOn && !luckyOn)) return;
+            Vision.Result rs = planRes;
+            float sx = getWidth() / 2400f, sy = getHeight() / 1080f;
+            tx.setTextAlign(Paint.Align.CENTER); tx.setTextSize(17 * d); tx.setShadowLayer(4 * d, 0, 0, 0xFF000000);
+            p.setPathEffect(null); p.setStyle(Paint.Style.STROKE);
+            if (curLucky != null && rs != null) {
+                Planner.Lucky L = curLucky;
+                p.setStrokeWidth(2f * d); p.setColor(0xFF7CFC00);
+                p.setPathEffect(new DashPathEffect(new float[]{10 * d, 7 * d}, 0));
+                c.drawLine(rs.cx, rs.cy, rs.cx + (float) Math.cos(L.ang) * 1500 * sx, rs.cy + (float) Math.sin(L.ang) * 1500 * sx, p);
+                p.setPathEffect(null);
+                if (L.tn > 1) {
+                    ArrayList<float[]> pts = new ArrayList<>();
+                    for (int i = 0; i < L.tn; i++) pts.add(new float[]{L.trail[2 * i], L.trail[2 * i + 1]});
+                    p.setStrokeWidth(3 * d); p.setColor(0xFFFFD700); c.drawPath(path(pts), p);
+                }
+                p.setStrokeWidth(2.5f * d); p.setColor(0xFFFFFFFF); c.drawCircle(L.fx, L.fy, sR, p);
+                p.setColor(0xFF00E5FF); c.drawCircle(rs.tx, rs.ty, rs.tr, p);
+                float f = Planner.powerFrac(L.L0);
+                tick(c, f, sx, sy, 0xFF7CFC00);
+                tx.setColor(L.ok ? 0xFF7CFC00 : 0xFFFFD54F);
+                c.drawText("Lucky Shot: сила " + Math.round(f * 100) + "%" + turnText(L.ang) + (L.ok ? "" : " (решение неточное)"), getWidth() / 2f, 76 * d, tx);
+            } else if (curHint != null && rs != null) {
+                Planner.Hint H = curHint;
+                p.setStrokeWidth(2.5f * d); p.setColor(0xFF7CFC00);
+                c.drawLine(rs.cx, rs.cy, H.gx, H.gy, p);
+                p.setColor(0xFFFFFFFF); c.drawCircle(H.gx, H.gy, sR, p);
+                if (H.tn > 1) {
+                    ArrayList<float[]> pts = new ArrayList<>();
+                    for (int i = 0; i < H.tn; i++) pts.add(new float[]{H.trail[2 * i], H.trail[2 * i + 1]});
+                    p.setStrokeWidth(3 * d); p.setColor(0xFFFFD54F); c.drawPath(path(pts), p);
+                }
+                float[] pk = new Planner.World(rs).pk[H.pocket];
+                p.setStrokeWidth(3 * d); p.setColor(0xFF00E5FF); c.drawCircle(pk[0], pk[1], 1.6f * sR, p);
+                float f = Planner.powerFrac(H.L0);
+                tick(c, f, sx, sy, 0xFF7CFC00);
+                tx.setColor(0xFF7CFC00);
+                c.drawText("Подсказка: сила " + Math.round(f * 100) + "%, надёжность " + Math.round(H.rate * 100) + "%" + turnText(H.ang), getWidth() / 2f, 76 * d, tx);
+            } else if (planMsg != null) {
+                tx.setColor(0xFFFFD54F); c.drawText(planMsg, getWidth() / 2f, 76 * d, tx);
+            } else if (planning) {
+                tx.setColor(0xFFFFFFFF); c.drawText("Считаю удар…", getWidth() / 2f, 76 * d, tx);
+            }
+        }
+
         void drawClean(Canvas c) {
+            drawPlan(c);
             final int PINK = 0xFFFF4FB8, GREEN = 0xFF5FE08A, YELLOW = 0xFFF2C94C, RED = 0xFFFF6B5E;
             tx.setTextAlign(Paint.Align.CENTER); tx.setTextSize(18 * d); tx.setShadowLayer(4 * d, 0, 0, 0xFF000000);
             if (!have) {
@@ -557,6 +707,11 @@ class Vision {
         public float ox, oy;                  // шар, в который целимся
         public int nb;                        // все остальные шары на столе (без битка)
         public float[] bx = new float[0], by = new float[0];
+        public int[] bt = new int[0];         // тип каждого шара: 0 целый, 1 полосатый, 2 восьмёрка
+        public boolean[] gold = new boolean[0]; // золотой шар (жёлтый оттенок): нужен только для Lucky Shot
+        public boolean hasTarget;             // мишень Lucky Shot (жёлтый центр)
+        public float tx, ty, tr;
+        public boolean myTurn = true;         // ход игрока (зелёная рамка у левого аватара); если не видно - считаем, что мой
     }
 
     public static boolean DEBUG = false;
@@ -582,14 +737,15 @@ class Vision {
     static float[] pocketFrame(int[] px, int w, int h) {
         // от самого строгого порога «чёрного» к мягкому: у тёмных столов края сукна не должны слипаться с лузами
         int[] thr = {26, 12, 40};
-        for (int v : thr) {
-            float[] f = pocketFrameT(px, w, h, v);
+        float[] sizes = {0.026f, 0.020f};   // у чёрных столов ядро лузы меньше
+        for (float sz : sizes) for (int v : thr) {
+            float[] f = pocketFrameT(px, w, h, v, sz);
             if (f != null) return f;
         }
         return null;
     }
 
-    static float[] pocketFrameT(int[] px, int w, int h, int thr) {
+    static float[] pocketFrameT(int[] px, int w, int h, int thr, float minSize) {
         int mw = w / 2, mh = h / 2;
         boolean[] dk = new boolean[mw * mh];
         for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
@@ -610,7 +766,7 @@ class Vision {
         ArrayList<float[]> c = new ArrayList<>();
         for (int v = 1; v <= n; v++) {
             float bw = (x1[v] - x0[v] + 1) * 2f, bh = (y1[v] - y0[v] + 1) * 2f;
-            if (bw < 0.026f * w || bw > 0.045f * w || bh < 0.026f * w || bh > 0.045f * w) continue;   // размер угловой лузы (кружки счёта меньше)
+            if (bw < minSize * w || bw > 0.045f * w || bh < minSize * w || bh > 0.045f * w) continue;   // размер угловой лузы
             if (cnt[v] * 4f < 0.40f * bw * bh) continue;
             float asp = bw / bh; if (asp < 0.6f || asp > 1.67f) continue;
             c.add(new float[]{(float) (sx[v] / cnt[v]) * 2f, (float) (sy[v] / cnt[v]) * 2f});
@@ -946,7 +1102,32 @@ class Vision {
             if (fit != null && fit[0] > bestLen) { bestLen = fit[0]; bestFit = fit; }
         }
         if (bestFit == null || bestLen < 3 * r) {
-            if (bestWhite >= 0.65) { res.cueOk = true; res.cx = wx; res.cy = wy; }
+            // Линии игры нет (игрок не касается экрана). Шары всё равно собираем: они нужны подсказке и Lucky Shot.
+            peakT = 6.8f * r;
+            float[][] sp0 = shapePeaks(px, w, h, res, false);
+            int ci = -1; float cBest = 0;
+            for (int i = 0; i < sp0.length; i++) {
+                float[] st = ballStats(px, w, h, sp0[i][0], sp0[i][1], r);
+                float wt = whiteTotal(px, w, h, sp0[i][0], sp0[i][1], r);
+                if (wt >= 0.72f && wt > cBest) { cBest = wt; ci = i; }
+            }
+            if (ci >= 0) { res.cueOk = true; res.cx = sp0[ci][0]; res.cy = sp0[ci][1]; }
+            else if (bestWhite >= 0.65) { res.cueOk = true; res.cx = wx; res.cy = wy; }
+            if (sp0.length >= 2) {
+                float pcx0 = (res.l + res.rr) / 2f;
+                float[] qx = new float[sp0.length], qy = new float[sp0.length]; int nq = 0;
+                for (int i = 0; i < sp0.length; i++) {
+                    float X = sp0[i][0], Y = sp0[i][1];
+                    if (i == ci) continue;
+                    if (res.cueOk && Math.hypot(X - res.cx, Y - res.cy) < 1.2f * r) continue;
+                    boolean nearL = X < res.l + 2.6f * r || X > res.rr - 2.6f * r, nearT = Y < res.t + 2.6f * r || Y > res.b - 2.6f * r;
+                    if (nearL && nearT) continue;
+                    if (Math.abs(X - pcx0) < 2.3f * r && (Y < res.t + 2.3f * r || Y > res.b - 2.3f * r)) continue;
+                    qx[nq] = X; qy[nq] = Y; nq++;
+                }
+                res.nb = nq; res.bx = java.util.Arrays.copyOf(qx, nq); res.by = java.util.Arrays.copyOf(qy, nq);
+            }
+            finishExtras(px, w, h, res);
             res.msg = "Не вижу линию прицела игры. Наведите кий на шар, чтобы игра показала линию.";
             return res;
         }
@@ -1020,6 +1201,7 @@ class Vision {
         }
         findBalls(px, w, h, res, h0);
         }
+        finishExtras(px, w, h, res);
         res.ok = true;
         res.msg = res.hasObj ? "Готово: стол, биток, прицел и шар найдены." : "Стол, биток и прицел найдены. Шар на линии не найден (линия идёт в борт).";
         return res;
@@ -1027,6 +1209,118 @@ class Vision {
 
     /** Ищет белую линию прицела, выходящую из точки (cx,cy). Возвращает {длина, угол, cx', cy', конецX, конецY} или null. */
     /** Все шары на столе (кроме битка): «не сукно» -> стирание тонких линий и кия -> центры пятен; слипшиеся пятна делим усиленным стиранием. */
+    /** Доля белого в круге 0.95R: у битка почти весь шар белый. */
+    static float whiteTotal(int[] px, int w, int h, float cx, float cy, float r) {
+        int rad = Math.round(0.95f * r), tot = 0, wh = 0;
+        for (int y = Math.round(cy) - rad; y <= Math.round(cy) + rad; y++) for (int x = Math.round(cx) - rad; x <= Math.round(cx) + rad; x++) {
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > rad * rad) continue;
+            int p = px[y * w + x]; int rr = R(p), gg = G(p), bb = B(p);
+            tot++;
+            if (rr >= 190 && gg >= 185 && bb >= 160 && rr - bb <= 80 && Math.abs(rr - gg) <= 35) wh++;
+        }
+        return tot == 0 ? 0 : (float) wh / tot;
+    }
+
+    /** Тип шара: 0 целый, 1 полосатый, 2 восьмёрка. Полосатые отличаются белыми «шапками» у края шара. */
+    static int ballType(int[] px, int w, int h, float cx, float cy, float r) {
+        int tot = 0, ann = 0, annW = 0, dk = 0, all = 0;
+        int rad = Math.round(0.95f * r);
+        for (int y = Math.round(cy) - rad; y <= Math.round(cy) + rad; y++) for (int x = Math.round(cx) - rad; x <= Math.round(cx) + rad; x++) {
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            float d = (float) Math.hypot(x - cx, y - cy);
+            if (d > 0.95f * r) continue;
+            int p = px[y * w + x]; int rr = R(p), gg = G(p), bb = B(p);
+            all++;
+            if (Math.max(rr, Math.max(gg, bb)) < 55) dk++;
+            if (d > 0.55f * r) {
+                ann++;
+                if (rr >= 190 && gg >= 185 && bb >= 160 && rr - bb <= 80 && Math.abs(rr - gg) <= 35) annW++;
+            }
+        }
+        if (all == 0) return 0;
+        if ((float) dk / all > 0.5f) return 2;
+        return ann > 0 && (float) annW / ann >= 0.17f ? 1 : 0;
+    }
+
+    /** Золотой шар Lucky Shot: жёлтый оттенок и высокая насыщенность. */
+    static boolean isGold(int[] px, int w, int h, float cx, float cy, float r) {
+        float[] st = ballStats(px, w, h, cx, cy, r);
+        return st[2] >= 33 && st[2] <= 52 && st[3] > 0.6f && st[4] > 0.7f;
+    }
+
+    /** Ход игрока: у активного игрока вокруг аватара зелёная рамка (в разметке экрана 2400x1080). */
+    static boolean turnMine(int[] px, int w, int h) {
+        float sx = w / 2400f, sy = h / 1080f;
+        int left = 0, right = 0;
+        for (int y = Math.round(15 * sy); y < Math.round(165 * sy); y += 2) {
+            for (int x = Math.round(955 * sx); x < Math.round(1105 * sx); x += 2) {
+                int p = px[y * w + x]; if (G(p) >= 200 && R(p) <= 70 && B(p) <= 70) left++;
+            }
+            for (int x = Math.round(1295 * sx); x < Math.round(1445 * sx); x += 2) {
+                int p = px[y * w + x]; if (G(p) >= 200 && R(p) <= 70 && B(p) <= 70) right++;
+            }
+        }
+        if (right > left + 60) return false;
+        return true;
+    }
+
+    /** Мишень Lucky Shot: самый большой ярко-жёлтый круг на столе. */
+    static void findTarget(int[] px, int w, int h, Result res) {
+        int il = Math.round(res.l), it = Math.round(res.t), ir = Math.round(res.rr), ib = Math.round(res.b);
+        int mw = (ir - il) / 2 + 1, mh = (ib - it) / 2 + 1;
+        boolean[] m = new boolean[mw * mh];
+        float[] t = new float[3]; int cnt = 0;
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
+            int X = il + 2 * x, Y = it + 2 * y; if (X >= w || Y >= h) continue;
+            hsv(px[Y * w + X], t);
+            if (t[0] >= 46 && t[0] <= 66 && t[1] >= 0.55f && t[2] >= 0.85f) { m[y * mw + x] = true; cnt++; }
+        }
+        if (cnt < 200) return;
+        int[] lab = label(m, mw, mh);
+        int n = 0; for (int v : lab) if (v > n) n = v;
+        int[] c = new int[n + 1]; double[] sx = new double[n + 1], sy = new double[n + 1];
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) { int v = lab[y * mw + x]; if (v == 0) continue; c[v]++; sx[v] += x; sy[v] += y; }
+        int best = -1; double bestA = 0;
+        for (int v = 1; v <= n; v++) { double a = c[v] * 4.0; if (a > bestA) { bestA = a; best = v; } }
+        double rr = Math.sqrt(bestA / Math.PI);
+        if (best < 0 || rr < 1.2f * res.r || rr > 3.2f * res.r) return;
+        res.hasTarget = true; res.tx = (float) (il + 2 * sx[best] / c[best]); res.ty = (float) (it + 2 * sy[best] / c[best]); res.tr = (float) rr;
+    }
+
+    /** Дополнительные данные для подсказки и Lucky Shot: типы шаров, мишень, чей ход. */
+    static void finishExtras(int[] px, int w, int h, Result res) {
+        res.bt = new int[res.nb]; res.gold = new boolean[res.nb];
+        for (int i = 0; i < res.nb; i++) {
+            res.bt[i] = ballType(px, w, h, res.bx[i], res.by[i], res.r);
+            res.gold[i] = res.bt[i] != 2 && isGold(px, w, h, res.bx[i], res.by[i], res.r);
+        }
+        if (res.tableOk) findTarget(px, w, h, res);
+        res.myTurn = turnMine(px, w, h);
+    }
+
+    /** Цветовая статистика шара в круге радиуса 0.85R: {доля белого, доля тёмного, оттенок, насыщенность, яркость цветной части}. */
+    static float[] ballStats(int[] px, int w, int h, float cx, float cy, float r) {
+        int rad = Math.round(0.85f * r), tot = 0, wh = 0, dk = 0, col = 0;
+        double sh = 0, ss = 0, sv = 0, hx = 0, hy = 0;
+        float[] t = new float[3];
+        for (int y = Math.round(cy) - rad; y <= Math.round(cy) + rad; y++) for (int x = Math.round(cx) - rad; x <= Math.round(cx) + rad; x++) {
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > rad * rad) continue;
+            int p = px[y * w + x]; int rr = R(p), gg = G(p), bb = B(p);
+            tot++;
+            if (rr >= 190 && gg >= 185 && bb >= 160 && rr - bb <= 80 && Math.abs(rr - gg) <= 35) { wh++; continue; }
+            if (Math.max(rr, Math.max(gg, bb)) < 55) { dk++; continue; }
+            hsv(p, t);
+            if (t[1] < 0.25f) continue;
+            col++; ss += t[1]; sv += t[2];
+            hx += Math.cos(Math.toRadians(t[0])); hy += Math.sin(Math.toRadians(t[0]));
+        }
+        if (tot == 0) return new float[]{0, 0, 0, 0, 0};
+        float hue = col > 0 ? (float) ((Math.toDegrees(Math.atan2(hy, hx)) + 360) % 360) : 0;
+        return new float[]{(float) wh / tot, (float) dk / tot, hue, col > 0 ? (float) (ss / col) : 0, col > 0 ? (float) (sv / col) : 0};
+    }
+
     /** Шары по форме, а не по цвету: каждая точка края голосует за центр круга радиуса R по направлению градиента. */
     static float edgeT = 110f, peakT = 60f;
     static float[][] shapePeaks(int[] px, int w, int h, Result res, boolean debug) {
@@ -1260,5 +1554,246 @@ class Vision {
             if (nonCloth(px[yy * w + xx], xx, yy, h0, t)) non++;
         }
         return tot == 0 ? 0 : non / (double) tot;
+    }
+}
+
+/** Расчёт ударов: упрощённая физика (постоянное торможение, упругие столкновения шаров, отскок от бортов, лузы). */
+class Planner {
+    static float EB = 0.96f;        // упругость шар-шар
+    static float EC = 0.75f;        // упругость борта
+    static float L0MAX = 6000f;     // расстояние, которое пролетает битка при 100% силы (калибруется)
+    static final float DT = 0.02f;  // шаг времени; торможение A = 1, пробег = v^2 / 2
+
+    static class World {
+        float l, t, r, b, R;        // границы для центра шара
+        float[][] pk;               // лузы: {x, y, радиус захвата}
+        World(Vision.Result res) {
+            R = 0.96f * res.r;
+            l = res.l + R; t = res.t + R; r = res.rr - R; b = res.b - R;
+            float cx = (res.l + res.rr) / 2f, cr = 2.5f * R, sr = 2.2f * R;
+            pk = new float[][]{{res.l, res.t, cr}, {res.rr, res.t, cr}, {res.l, res.b, cr}, {res.rr, res.b, cr}, {cx, res.t, sr}, {cx, res.b, sr}};
+        }
+    }
+
+    static class Sim {
+        final World w; final int n;
+        final float[] x, y, vx, vy; final boolean[] in; final int[] pocket;
+        int tn;
+        Sim(World w, int n) { this.w = w; this.n = n; x = new float[n]; y = new float[n]; vx = new float[n]; vy = new float[n]; in = new boolean[n]; pocket = new int[n]; }
+        void reset(float[] sx, float[] sy) {
+            for (int i = 0; i < n; i++) { x[i] = sx[i]; y[i] = sy[i]; vx[i] = 0; vy[i] = 0; in[i] = false; pocket[i] = -1; }
+        }
+        void shoot(float ang, float L0) {
+            float v = (float) Math.sqrt(2f * L0);
+            vx[0] = (float) Math.cos(ang) * v; vy[0] = (float) Math.sin(ang) * v;
+        }
+        void run(int maxSteps, int ti, float[] trail) {
+            float d2 = 4 * w.R * w.R; tn = 0;
+            for (int step = 0; step < maxSteps; step++) {
+                boolean any = false;
+                for (int i = 0; i < n; i++) {
+                    if (in[i]) continue;
+                    float sp2 = vx[i] * vx[i] + vy[i] * vy[i];
+                    if (sp2 < 1e-6f) { vx[i] = 0; vy[i] = 0; continue; }
+                    float sp = (float) Math.sqrt(sp2), ns = sp - DT;
+                    if (ns <= 0.05f) { vx[i] = 0; vy[i] = 0; continue; }
+                    any = true;
+                    float k = ns / sp; vx[i] *= k; vy[i] *= k;
+                    x[i] += vx[i] * DT; y[i] += vy[i] * DT;
+                    for (int q = 0; q < 6; q++) {
+                        float dx = x[i] - w.pk[q][0], dy = y[i] - w.pk[q][1];
+                        if (dx * dx + dy * dy < w.pk[q][2] * w.pk[q][2]) { in[i] = true; pocket[i] = q; vx[i] = 0; vy[i] = 0; break; }
+                    }
+                    if (in[i]) continue;
+                    if (x[i] < w.l) { x[i] = w.l; if (vx[i] < 0) vx[i] = -vx[i] * EC; } else if (x[i] > w.r) { x[i] = w.r; if (vx[i] > 0) vx[i] = -vx[i] * EC; }
+                    if (y[i] < w.t) { y[i] = w.t; if (vy[i] < 0) vy[i] = -vy[i] * EC; } else if (y[i] > w.b) { y[i] = w.b; if (vy[i] > 0) vy[i] = -vy[i] * EC; }
+                }
+                if (trail != null && step % 4 == 0 && 2 * tn + 1 < trail.length && !in[ti]) { trail[2 * tn] = x[ti]; trail[2 * tn + 1] = y[ti]; tn++; }
+                if (!any) break;
+                for (int i = 0; i < n; i++) {
+                    if (in[i]) continue;
+                    for (int j = i + 1; j < n; j++) {
+                        if (in[j]) continue;
+                        float dx = x[j] - x[i], dy = y[j] - y[i];
+                        float dd = dx * dx + dy * dy;
+                        if (dd >= d2 || dd < 1e-6f) continue;
+                        float rvx = vx[i] - vx[j], rvy = vy[i] - vy[j];
+                        float d = (float) Math.sqrt(dd), nx = dx / d, ny = dy / d;
+                        float rv = rvx * nx + rvy * ny;
+                        if (rv <= 0) continue;                       // расходятся
+                        float imp = (1f + EB) * 0.5f * rv;
+                        vx[i] -= imp * nx; vy[i] -= imp * ny; vx[j] += imp * nx; vy[j] += imp * ny;
+                        float push = (2 * w.R - d) * 0.5f + 0.01f;
+                        x[i] -= nx * push; y[i] -= ny * push; x[j] += nx * push; y[j] += ny * push;
+                    }
+                }
+            }
+            if (trail != null && !in[ti] && 2 * tn + 1 < trail.length) { trail[2 * tn] = x[ti]; trail[2 * tn + 1] = y[ti]; tn++; }
+        }
+    }
+
+    static float powerFrac(float L0) { return Math.min(1f, (float) Math.sqrt(L0 / L0MAX)); }
+
+    // ---------------- Lucky Shot ----------------
+    static class Lucky {
+        float ang, L0, cost, robust, fx, fy;
+        float[] trail = new float[0]; int tn;
+        boolean ok;
+    }
+
+    static float luckyCost(Sim s, int g, float tx, float ty) {
+        if (s.in[g]) return 1e6f;
+        float c = (float) Math.hypot(s.x[g] - tx, s.y[g] - ty);
+        if (s.in[0]) c += 300f;            // биток в лузе: плохо
+        return c;
+    }
+
+    static Lucky lucky(World wd, float cx, float cy, float[] bx, float[] by, int gi, float tx, float ty, long budgetMs) {
+        long t0 = System.nanoTime();
+        int n = 1 + bx.length, g = gi + 1;
+        float[] sx = new float[n], sy = new float[n];
+        sx[0] = cx; sy[0] = cy;
+        for (int i = 0; i < bx.length; i++) { sx[i + 1] = bx[i]; sy[i + 1] = by[i]; }
+        Sim s = new Sim(wd, n);
+        float gx0 = sx[g], gy0 = sy[g];
+        // грубый перебор: углы и силы
+        ArrayList<float[]> cand = new ArrayList<>();   // {cost, ang, L0}
+        int na = 240;
+        for (int ia = 0; ia < na; ia++) {
+            float ang = (float) (2 * Math.PI * ia / na);
+            s.reset(sx, sy); s.shoot(ang, L0MAX); s.run(9000, 0, null);
+            boolean touched = false;
+            for (int i = 1; i < n; i++) if (Math.hypot(s.x[i] - sx[i], s.y[i] - sy[i]) > 1f || s.in[i]) { touched = true; break; }
+            if (!touched) continue;
+            for (float L0 = 100f; L0 <= L0MAX; L0 *= 1.25f) {
+                s.reset(sx, sy); s.shoot(ang, L0); s.run(9000, 0, null);
+                float c = luckyCost(s, g, tx, ty);
+                cand.add(new float[]{c, ang, L0});
+            }
+            if ((System.nanoTime() - t0) / 1000000 > budgetMs * 0.5) break;
+        }
+        cand.sort((p, q) -> Float.compare(p[0], q[0]));
+        // уточнение лучших кандидатов (разные по углу)
+        ArrayList<float[]> top = new ArrayList<>();
+        for (float[] c : cand) {
+            boolean dup = false;
+            for (float[] o : top) if (Math.abs(o[1] - c[1]) < 0.03f) { dup = true; break; }
+            if (!dup) top.add(c);
+            if (top.size() >= 10) break;
+        }
+        Lucky best = null;
+        for (float[] c : top) {
+            float ba = c[1], bl = c[2], bc = c[0];
+            for (int round = 0; round < 3; round++) {
+                float da = (float) Math.toRadians(1.2f) / (1 + 2 * round), dl = 0.2f / (1 + 2 * round);
+                float na2 = ba, nl2 = bl;
+                for (int ia = -5; ia <= 5; ia++) for (int il = -5; il <= 5; il++) {
+                    float a = ba + da * ia / 5f, L = bl * (1f + dl * il / 5f);
+                    s.reset(sx, sy); s.shoot(a, L); s.run(9000, 0, null);
+                    float cc = luckyCost(s, g, tx, ty);
+                    if (cc < bc) { bc = cc; na2 = a; nl2 = L; }
+                }
+                ba = na2; bl = nl2;
+                if ((System.nanoTime() - t0) / 1000000 > budgetMs) break;
+            }
+            // устойчивость: небольшие ошибки в угле и силе
+            float rob = 0; int cnt = 0;
+            for (int da = -1; da <= 1; da++) for (int dl = -1; dl <= 1; dl++) {
+                s.reset(sx, sy); s.shoot(ba + (float) Math.toRadians(0.2f) * da, bl * (1f + 0.03f * dl)); s.run(9000, 0, null);
+                rob += luckyCost(s, g, tx, ty); cnt++;
+            }
+            rob /= cnt;
+            if (best == null || rob < best.robust) {
+                best = new Lucky(); best.ang = ba; best.L0 = bl; best.cost = bc; best.robust = rob;
+            }
+            if ((System.nanoTime() - t0) / 1000000 > budgetMs) break;
+        }
+        if (best == null) return null;
+        float[] trail = new float[2 * 1200];
+        s.reset(sx, sy); s.shoot(best.ang, best.L0); s.run(9000, g, trail);
+        best.trail = trail; best.tn = s.tn; best.fx = s.x[g]; best.fy = s.y[g];
+        best.ok = !s.in[g] && !s.in[0] && best.cost < 40f;
+        return best;
+    }
+
+    // ---------------- Подсказка для обычной партии ----------------
+    static class Hint {
+        int ball = -1, pocket = -1;
+        float ang, L0, score, rate, gx, gy;     // gx, gy: куда должен встать биток в момент касания
+        float[] trail = new float[0]; int tn;
+        float[] cueTrail = new float[0]; int ctn;
+    }
+
+    /** group: 0 любые (кроме восьмёрки), 1 целые, 2 полосатые. Цели считаются по типам: 0 целый, 1 полосатый, 2 восьмёрка. */
+    static Hint hint(World wd, float cx, float cy, float[] bx, float[] by, int[] bt, int group) {
+        int nb = bx.length, n = 1 + nb;
+        boolean[] cand = new boolean[nb];
+        int cnt = 0;
+        for (int i = 0; i < nb; i++) {
+            boolean ok = bt[i] != 2 && (group == 0 || (group == 1 && bt[i] == 0) || (group == 2 && bt[i] == 1));
+            cand[i] = ok; if (ok) cnt++;
+        }
+        if (cnt == 0) for (int i = 0; i < nb; i++) if (bt[i] == 2) { cand[i] = true; cnt++; }   // свои шары закончились: чёрный
+        float[] sx = new float[n], sy = new float[n];
+        sx[0] = cx; sy[0] = cy;
+        for (int i = 0; i < nb; i++) { sx[i + 1] = bx[i]; sy[i + 1] = by[i]; }
+        Sim s = new Sim(wd, n);
+        Hint best = null;
+        float R = wd.R;
+        for (int i = 0; i < nb; i++) {
+            if (!cand[i]) continue;
+            for (int q = 0; q < 6; q++) {
+                float px0 = wd.pk[q][0], py0 = wd.pk[q][1];
+                float tx = bx[i], ty = by[i];
+                float ux = px0 - tx, uy = py0 - ty, ul = (float) Math.hypot(ux, uy);
+                if (ul < 3 * R) continue;
+                ux /= ul; uy /= ul;
+                float gx = tx - ux * 2 * R, gy = ty - uy * 2 * R;
+                if (gx < wd.l - 2 || gx > wd.r + 2 || gy < wd.t - 2 || gy > wd.b + 2) continue;
+                float dx = gx - cx, dy = gy - cy, d1 = (float) Math.hypot(dx, dy);
+                if (d1 < 1.5f * R) continue;
+                float cos = (dx / d1) * ux + (dy / d1) * uy;
+                if (cos < 0.17f) continue;                    // слишком тонкий рез
+                float ang = (float) Math.atan2(dy, dx);
+                float L0est = (d1 + ul / (cos * cos)) * 1.0f;
+                // подбираем наименьшую силу, при которой шар падает в лузу
+                float useL = -1;
+                for (float m = 0.85f; m <= 2.6f; m *= 1.12f) {
+                    float L0 = L0est * m + 60f;
+                    if (L0 > L0MAX) break;
+                    s.reset(sx, sy); s.shoot(ang, L0); s.run(9000, 0, null);
+                    if (s.in[i + 1] && !s.in[0]) { useL = L0; break; }
+                }
+                if (useL < 0) continue;
+                useL = Math.min(L0MAX, useL * 1.12f);          // небольшой запас по силе
+                // устойчивость к ошибкам руки и положению шара
+                int okc = 0, tot = 0;
+                for (int da = -1; da <= 1; da++) for (int dl = -1; dl <= 1; dl += 2) {
+                    s.reset(sx, sy); s.shoot(ang + (float) Math.toRadians(0.25f) * da, useL * (1f + 0.05f * dl)); s.run(9000, 0, null);
+                    tot++; if (s.in[i + 1] && !s.in[0]) okc++;
+                }
+                float rate = (float) okc / tot;
+                // итоговое положение битка
+                s.reset(sx, sy); s.shoot(ang, useL); s.run(9000, 0, null);
+                float score = rate * 100f - 0.01f * useL;
+                if (!s.in[0]) {
+                    // биток лучше оставить подальше от лузы и не у борта
+                    float minP = 1e9f;
+                    for (int k = 0; k < 6; k++) minP = Math.min(minP, (float) Math.hypot(s.x[0] - wd.pk[k][0], s.y[0] - wd.pk[k][1]));
+                    score += Math.min(minP, 6 * R) * 0.02f;
+                }
+                if (best == null || score > best.score) {
+                    best = new Hint(); best.ball = i; best.pocket = q; best.ang = ang; best.L0 = useL; best.score = score; best.rate = rate; best.gx = gx; best.gy = gy;
+                }
+            }
+        }
+        if (best != null) {
+            float[] trail = new float[2 * 600], ct = new float[2 * 600];
+            s.reset(sx, sy); s.shoot(best.ang, best.L0); s.run(9000, best.ball + 1, trail);
+            best.trail = trail; best.tn = s.tn;
+            s.reset(sx, sy); s.shoot(best.ang, best.L0); s.run(9000, 0, ct);
+            best.cueTrail = ct; best.ctn = s.tn;
+        }
+        return best;
     }
 }
