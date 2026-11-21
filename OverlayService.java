@@ -54,7 +54,9 @@ public class OverlayService extends Service {
     Runnable watch;
     String lastMsg;                   // почему сейчас нет прицела (для автоскана)
     // --- подсказка и Lucky Shot (только автоскан) ---
-    boolean hintOn, luckyOn, planning;
+    boolean hintOn, luckyOn, planning, hiddenForPlan;   // hintOn/luckyOn включаются в главном меню
+    int planKind, staleCnt;           // planKind: 1 подсказка, 2 Lucky Shot (ждём кадр для одноразового расчёта)
+    Button bScanH, bScanL;
     int group;                        // какие шары мои: 0 любые, 1 целые, 2 полосатые
     Planner.Hint curHint; Planner.Lucky curLucky;
     Vision.Result planRes;            // кадр, по которому построен план
@@ -154,37 +156,44 @@ public class OverlayService extends Service {
         if (mode == 0) { panel.addView(bM); panel.addView(bP); }
         if (mode == 2) {
             final android.content.SharedPreferences sp = getSharedPreferences("aim", MODE_PRIVATE);
+            hintOn = sp.getBoolean("hint_on", false);       // включаются в главном меню приложения
+            luckyOn = sp.getBoolean("lucky_on", false);
             Planner.L0MAX = sp.getFloat("l0max", 6000f);
-            final Button bH = btn("Подсказка: выкл");
-            bH.setOnClickListener(v -> {
-                hintOn = !hintOn; bH.setText(hintOn ? "Подсказка: вкл" : "Подсказка: выкл");
-                curHint = null; planSig = 0; stable = 0; lines.invalidate();
-            });
-            final Button bL = btn("Lucky: выкл");
-            bL.setOnClickListener(v -> {
-                luckyOn = !luckyOn; bL.setText(luckyOn ? "Lucky: вкл" : "Lucky: выкл");
-                curLucky = null; planSig = 0; stable = 0; lines.invalidate();
-            });
-            final Button bG = btn("Шары: любые");
-            bG.setOnClickListener(v -> {
-                group = (group + 1) % 3; bG.setText(group == 0 ? "Шары: любые" : group == 1 ? "Шары: целые" : "Шары: полосатые");
-                curHint = null; planSig = 0; stable = 0; lines.invalidate();
-            });
-            // Калибровка силы: «Сила+» показывает нужную силу больше, «Сила-» меньше
-            Button bSu = btn("Сила+"); bSu.setOnClickListener(v -> {
-                Planner.L0MAX *= 0.92f; sp.edit().putFloat("l0max", Planner.L0MAX).apply(); curHint = null; curLucky = null; planSig = 0; stable = 0;
-                Toast.makeText(this, "Нужная сила в подсказках стала больше", Toast.LENGTH_SHORT).show(); lines.invalidate();
-            });
-            Button bSd = btn("Сила-"); bSd.setOnClickListener(v -> {
-                Planner.L0MAX /= 0.92f; sp.edit().putFloat("l0max", Planner.L0MAX).apply(); curHint = null; curLucky = null; planSig = 0; stable = 0;
-                Toast.makeText(this, "Нужная сила в подсказках стала меньше", Toast.LENGTH_SHORT).show(); lines.invalidate();
-            });
-            panel.addView(bH); panel.addView(bG); panel.addView(bL); panel.addView(bSd); panel.addView(bSu);
+            if (hintOn || luckyOn) {
+                // узкая колонка слева, вне стола: кнопки не должны попадать в кадр, где ищем шары
+                panel.setOrientation(LinearLayout.VERTICAL);
+                if (hintOn) {
+                    bScanH = btn2("Скан\nподсказка"); bScanH.setOnClickListener(v -> requestPlan(1));
+                    final Button bG = btn2("Шары:\nлюбые");
+                    bG.setOnClickListener(v -> {
+                        group = (group + 1) % 3; bG.setText(group == 0 ? "Шары:\nлюбые" : group == 1 ? "Шары:\nцелые" : "Шары:\nполосат.");
+                        curHint = null; lines.invalidate();
+                    });
+                    panel.addView(bScanH); panel.addView(bG);
+                }
+                if (luckyOn) { bScanL = btn2("Скан LS"); bScanL.setOnClickListener(v -> requestPlan(2)); panel.addView(bScanL); }
+                // Калибровка силы: «Сила+» показывает нужную силу больше, «Сила-» меньше
+                Button bSu = btn2("Сила +"); bSu.setOnClickListener(v -> {
+                    Planner.L0MAX *= 0.92f; sp.edit().putFloat("l0max", Planner.L0MAX).apply(); curHint = null; curLucky = null;
+                    Toast.makeText(this, "Нужная сила в подсказках стала больше. Нажмите скан ещё раз.", Toast.LENGTH_SHORT).show(); lines.invalidate();
+                });
+                Button bSd = btn2("Сила -"); bSd.setOnClickListener(v -> {
+                    Planner.L0MAX /= 0.92f; sp.edit().putFloat("l0max", Planner.L0MAX).apply(); curHint = null; curLucky = null;
+                    Toast.makeText(this, "Нужная сила в подсказках стала меньше. Нажмите скан ещё раз.", Toast.LENGTH_SHORT).show(); lines.invalidate();
+                });
+                panel.addView(bSd); panel.addView(bSu);
+            }
         }
         panel.addView(bS); panel.addView(bX);
         LayoutParams pp = new LayoutParams(-2, -2, type(), LayoutParams.FLAG_NOT_FOCUSABLE | LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT);
         pp.gravity = Gravity.BOTTOM | Gravity.LEFT;
         wm.addView(panel, pp);
+    }
+
+    Button btn2(String t) {            // узкая кнопка для колонки слева
+        Button b = btn(t);
+        b.setTextSize(10); b.setPadding((int) (3 * d), (int) (4 * d), (int) (3 * d), (int) (4 * d));
+        return b;
     }
 
     Button btn(String t) {
@@ -260,6 +269,7 @@ public class OverlayService extends Service {
         long now = SystemClock.uptimeMillis();
         boolean take = !busy && (wantShot || (mode == 2 && now - lastScan > 300));
         if (!take) { try { img.close(); } catch (Exception e) {} return; }
+        final boolean shotFrame = wantShot;
         busy = true; wantShot = false; lastScan = now;
         final int w = img.getWidth(), h = img.getHeight();
         int[] pixels = null;
@@ -274,6 +284,7 @@ public class OverlayService extends Service {
             bmp.recycle();
         } catch (Throwable e) { pixels = null; }
         try { img.close(); } catch (Exception e) {}
+        if (shotFrame && hiddenForPlan) ui.post(this::restoreLines);
         final int[] px = pixels;
         new Thread(() -> {
             Vision.Result res = null;
@@ -328,50 +339,76 @@ public class OverlayService extends Service {
         return h * 1000003L + r.nb;
     }
 
-    // Подсказка и Lucky Shot считаем, когда шары стоят (два одинаковых кадра подряд), в фоне
-    void maybePlan(Vision.Result res) {
-        if (mode != 2 || (!hintOn && !luckyOn)) return;
-        if (res == null || !res.tableOk || !res.cueOk || res.nb < 1) return;
-        long sig = sigOf(res);
-        if (sig != lastSig) {
-            lastSig = sig; stable = 0;
-            if (sig != planSig) { curHint = null; curLucky = null; planMsg = null; lines.invalidate(); }
-            return;
-        }
-        stable++;
-        if (stable < 1 || sig == planSig || planning) return;
-        planning = true;
-        final Vision.Result rs = res; final boolean doL = luckyOn, doH = hintOn; final int grp = group; final long fsig = sig;
+    // Одноразовый расчёт по кнопке: прячем свой оверлей, ждём свежий кадр без него, разбираем стол и считаем удар
+    void requestPlan(final int kind) {
+        if (proj == null) { toast("Нет доступа к экрану. Выключите и включите линейку заново."); return; }
+        if (planKind != 0 || planning) return;
+        planKind = kind; curHint = null; curLucky = null; planMsg = "Сканирую…";
+        hiddenForPlan = true; lines.setVisibility(View.INVISIBLE);
+        final Button nb = kind == 1 ? bScanH : bScanL;
+        ui.postDelayed(() -> {
+            if (planKind == 0) return;
+            wantShot = true;                                     // следующий кадр разбираем сразу
+            if (nb != null) { final CharSequence old = nb.getText(); nb.setText("Скан…"); ui.postDelayed(() -> nb.setText(old), 500); } // меняем картинку, чтобы пришёл свежий кадр
+        }, 250);
+        ui.postDelayed(() -> {
+            if (planKind != 0 && wantShot) { wantShot = false; planKind = 0; planMsg = "Не получен кадр экрана. Попробуйте ещё раз."; restoreLines(); }
+        }, 3500);
+    }
+
+    void restoreLines() {
+        hiddenForPlan = false;
+        if (lines != null) { lines.setVisibility(shown ? View.VISIBLE : View.GONE); lines.invalidate(); }
+    }
+
+    void startPlan(final Vision.Result rs, final int kind) {
+        if (!rs.tableOk) { planMsg = "Не вижу стол. Откройте игру на весь экран."; lines.invalidate(); return; }
+        if (!rs.cueOk) { planMsg = "Не вижу белый шар."; lines.invalidate(); return; }
+        planning = true; planMsg = "Считаю удар…"; lines.invalidate();
         new Thread(() -> {
             Planner.Hint hh = null; Planner.Lucky ll = null; String msg = null;
             try {
                 Planner.World wd = new Planner.World(rs);
-                if (doL) {
+                if (kind == 2) {
                     int gi = -1;
                     for (int i = 0; i < rs.nb; i++) if (rs.gold[i]) gi = i;
-                    if (rs.hasTarget && gi >= 0) ll = Planner.lucky(wd, rs.cx, rs.cy, rs.bx, rs.by, gi, rs.tx, rs.ty, 2500);
+                    if (rs.hasTarget && gi >= 0) { ll = Planner.lucky(wd, rs.cx, rs.cy, rs.bx, rs.by, gi, rs.tx, rs.ty, 9000); if (ll == null) msg = "Lucky Shot: решение не найдено"; }
                     else msg = "Lucky Shot: не вижу мишень или золотой шар";
-                }
-                if (doH && ll == null && !(doL && rs.hasTarget)) {
+                } else {
                     if (!rs.myTurn) msg = "Подсказка: сейчас ход соперника";
-                    else {
-                        hh = Planner.hint(wd, rs.cx, rs.cy, rs.bx, rs.by, rs.bt, grp);
-                        if (hh == null) msg = "Подсказка: подходящих ударов не нашла";
-                    }
+                    else { hh = Planner.hint(wd, rs.cx, rs.cy, rs.bx, rs.by, rs.bt, group); if (hh == null) msg = "Подсказка: подходящих ударов не нашла"; }
                 }
             } catch (Throwable e) { msg = "Ошибка расчёта удара"; }
             final Planner.Hint fh = hh; final Planner.Lucky fl = ll; final String fm = msg;
             ui.post(() -> {
-                planning = false; planSig = fsig; planRes = rs; curHint = fh; curLucky = fl; planMsg = fm;
+                planning = false; planRes = rs; curHint = fh; curLucky = fl; planMsg = fm; staleCnt = 0;
                 if (lines != null) lines.invalidate();
             });
         }).start();
     }
 
+    // План устарел, если сдвинулся биток или любой шар из плана (по двум кадрам подряд)
+    void checkStale(Vision.Result res) {
+        if ((curHint == null && curLucky == null) || planRes == null || res == null || !res.tableOk || !res.cueOk) return;
+        boolean stale = Math.hypot(res.cx - planRes.cx, res.cy - planRes.cy) > 8f;
+        if (!stale) {
+            for (int i = 0; i < planRes.nb && !stale; i++) {
+                boolean found = false;
+                for (int j = 0; j < res.nb; j++) if (Math.hypot(res.bx[j] - planRes.bx[i], res.by[j] - planRes.by[i]) < 10f) { found = true; break; }
+                if (!found) stale = true;
+            }
+        }
+        if (!stale) { staleCnt = 0; return; }
+        if (++staleCnt >= 2) { curHint = null; curLucky = null; planMsg = null; staleCnt = 0; }
+    }
+
     void finishScan(Vision.Result res) {
         busy = false;
         if (wm == null) return;
-        maybePlan(res);
+        if (planKind != 0) {
+            int k = planKind; planKind = 0;
+            if (res != null) startPlan(res, k); else { planMsg = "Не удалось разобрать кадр. Попробуйте ещё раз."; lines.invalidate(); }
+        } else checkStale(res);
         lastMsg = (res == null || res.ok) ? null : res.msg;
         if (res != null && res.ok) {
             failStreak = 0;
@@ -520,6 +557,11 @@ public class OverlayService extends Service {
             for (int i = 0; i < pts.size(); i++) { float[] a = pts.get(i); if (i == 0) q.moveTo(a[0], a[1]); else q.lineTo(a[0], a[1]); }
             return q;
         }
+        void mark(Canvas c, float x, float y, float r, int col) {
+            p.setPathEffect(null); p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(3 * d); p.setColor(col);
+            c.drawLine(x - r, y - r, x + r, y + r, p); c.drawLine(x - r, y + r, x + r, y - r, p);
+        }
+
         void tick(Canvas c, float frac, float sx, float sy, int col) {
             // шкала силы слева: 0% сверху, 100% снизу (в разметке экрана 2400x1080)
             float y = (345f + frac * 550f) * sy;
@@ -557,17 +599,17 @@ public class OverlayService extends Service {
                     for (int i = 0; i < L.tn; i++) pts.add(new float[]{L.trail[2 * i], L.trail[2 * i + 1]});
                     p.setStrokeWidth(3 * d); p.setColor(0xFFFFD700); c.drawPath(path(pts), p);
                 }
-                p.setStrokeWidth(2.5f * d); p.setColor(0xFFFFFFFF); c.drawCircle(L.fx, L.fy, sR, p);
+                mark(c, L.fx, L.fy, sR * 0.7f, 0xFFFFFFFF);
                 p.setColor(0xFF00E5FF); c.drawCircle(rs.tx, rs.ty, rs.tr, p);
                 float f = Planner.powerFrac(L.L0);
                 tick(c, f, sx, sy, 0xFF7CFC00);
                 tx.setColor(L.ok ? 0xFF7CFC00 : 0xFFFFD54F);
-                c.drawText("Lucky Shot: сила " + Math.round(f * 100) + "%" + turnText(L.ang) + (L.ok ? "" : " (решение неточное)"), getWidth() / 2f, 76 * d, tx);
+                c.drawText("Lucky Shot: сила " + Math.round(f * 100) + "%" + turnText(L.ang) + (L.ok ? "" : " (решение неточное)"), getWidth() * 0.6f, getHeight() - 22 * d, tx);
             } else if (curHint != null && rs != null) {
                 Planner.Hint H = curHint;
                 p.setStrokeWidth(2.5f * d); p.setColor(0xFF7CFC00);
                 c.drawLine(rs.cx, rs.cy, H.gx, H.gy, p);
-                p.setColor(0xFFFFFFFF); c.drawCircle(H.gx, H.gy, sR, p);
+                mark(c, H.gx, H.gy, sR * 0.7f, 0xFFFFFFFF);
                 if (H.tn > 1) {
                     ArrayList<float[]> pts = new ArrayList<>();
                     for (int i = 0; i < H.tn; i++) pts.add(new float[]{H.trail[2 * i], H.trail[2 * i + 1]});
@@ -578,11 +620,11 @@ public class OverlayService extends Service {
                 float f = Planner.powerFrac(H.L0);
                 tick(c, f, sx, sy, 0xFF7CFC00);
                 tx.setColor(0xFF7CFC00);
-                c.drawText("Подсказка: сила " + Math.round(f * 100) + "%, надёжность " + Math.round(H.rate * 100) + "%" + turnText(H.ang), getWidth() / 2f, 76 * d, tx);
+                c.drawText("Подсказка: сила " + Math.round(f * 100) + "%, надёжность " + Math.round(H.rate * 100) + "%" + turnText(H.ang), getWidth() * 0.6f, getHeight() - 22 * d, tx);
             } else if (planMsg != null) {
-                tx.setColor(0xFFFFD54F); c.drawText(planMsg, getWidth() / 2f, 76 * d, tx);
+                tx.setColor(0xFFFFD54F); c.drawText(planMsg, getWidth() * 0.6f, getHeight() - 22 * d, tx);
             } else if (planning) {
-                tx.setColor(0xFFFFFFFF); c.drawText("Считаю удар…", getWidth() / 2f, 76 * d, tx);
+                tx.setColor(0xFFFFFFFF); c.drawText("Считаю удар…", getWidth() * 0.6f, getHeight() - 22 * d, tx);
             }
         }
 
@@ -1106,10 +1148,11 @@ class Vision {
             peakT = 6.8f * r;
             float[][] sp0 = shapePeaks(px, w, h, res, false);
             int ci = -1; float cBest = 0;
+            boolean[] ringF = new boolean[sp0.length];
             for (int i = 0; i < sp0.length; i++) {
-                float[] st = ballStats(px, w, h, sp0[i][0], sp0[i][1], r);
+                ringF[i] = isRing(px, w, h, sp0[i][0], sp0[i][1], r);
                 float wt = whiteTotal(px, w, h, sp0[i][0], sp0[i][1], r);
-                if (wt >= 0.72f && wt > cBest) { cBest = wt; ci = i; }
+                if (!ringF[i] && wt >= 0.72f && wt > cBest) { cBest = wt; ci = i; }
             }
             if (ci >= 0) { res.cueOk = true; res.cx = sp0[ci][0]; res.cy = sp0[ci][1]; }
             else if (bestWhite >= 0.65) { res.cueOk = true; res.cx = wx; res.cy = wy; }
@@ -1118,7 +1161,7 @@ class Vision {
                 float[] qx = new float[sp0.length], qy = new float[sp0.length]; int nq = 0;
                 for (int i = 0; i < sp0.length; i++) {
                     float X = sp0[i][0], Y = sp0[i][1];
-                    if (i == ci) continue;
+                    if (i == ci || ringF[i]) continue;
                     if (res.cueOk && Math.hypot(X - res.cx, Y - res.cy) < 1.2f * r) continue;
                     boolean nearL = X < res.l + 2.6f * r || X > res.rr - 2.6f * r, nearT = Y < res.t + 2.6f * r || Y > res.b - 2.6f * r;
                     if (nearL && nearT) continue;
@@ -1209,6 +1252,23 @@ class Vision {
 
     /** Ищет белую линию прицела, выходящую из точки (cx,cy). Возвращает {длина, угол, cx', cy', конецX, конецY} или null. */
     /** Все шары на столе (кроме битка): «не сукно» -> стирание тонких линий и кия -> центры пятен; слипшиеся пятна делим усиленным стиранием. */
+    /** Белое кольцо-призрак игры: по окружности радиуса R почти всё белое (у шара край тёмный). */
+    static boolean isRing(int[] px, int w, int h, float cx, float cy, float r) {
+        int hit = 0, tot = 0;
+        for (int k = 0; k < 36; k++) {
+            double a = 2 * Math.PI * k / 36;
+            boolean any = false;
+            for (int dr = -1; dr <= 1; dr++) {
+                int x = Math.round(cx + (float) Math.cos(a) * (r + dr)), y = Math.round(cy + (float) Math.sin(a) * (r + dr));
+                if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                int p = px[y * w + x];
+                if (Math.min(R(p), Math.min(G(p), B(p))) >= 225) { any = true; break; }
+            }
+            tot++; if (any) hit++;
+        }
+        return tot > 0 && (float) hit / tot >= 0.6f;
+    }
+
     /** Доля белого в круге 0.95R: у битка почти весь шар белый. */
     static float whiteTotal(int[] px, int w, int h, float cx, float cy, float r) {
         int rad = Math.round(0.95f * r), tot = 0, wh = 0;
@@ -1578,7 +1638,7 @@ class Planner {
     static class Sim {
         final World w; final int n;
         final float[] x, y, vx, vy; final boolean[] in; final int[] pocket;
-        int tn;
+        int tn; float dt = DT;
         Sim(World w, int n) { this.w = w; this.n = n; x = new float[n]; y = new float[n]; vx = new float[n]; vy = new float[n]; in = new boolean[n]; pocket = new int[n]; }
         void reset(float[] sx, float[] sy) {
             for (int i = 0; i < n; i++) { x[i] = sx[i]; y[i] = sy[i]; vx[i] = 0; vy[i] = 0; in[i] = false; pocket[i] = -1; }
@@ -1595,11 +1655,11 @@ class Planner {
                     if (in[i]) continue;
                     float sp2 = vx[i] * vx[i] + vy[i] * vy[i];
                     if (sp2 < 1e-6f) { vx[i] = 0; vy[i] = 0; continue; }
-                    float sp = (float) Math.sqrt(sp2), ns = sp - DT;
+                    float sp = (float) Math.sqrt(sp2), ns = sp - dt;
                     if (ns <= 0.05f) { vx[i] = 0; vy[i] = 0; continue; }
                     any = true;
                     float k = ns / sp; vx[i] *= k; vy[i] *= k;
-                    x[i] += vx[i] * DT; y[i] += vy[i] * DT;
+                    x[i] += vx[i] * dt; y[i] += vy[i] * dt;
                     for (int q = 0; q < 6; q++) {
                         float dx = x[i] - w.pk[q][0], dy = y[i] - w.pk[q][1];
                         if (dx * dx + dy * dy < w.pk[q][2] * w.pk[q][2]) { in[i] = true; pocket[i] = q; vx[i] = 0; vy[i] = 0; break; }
@@ -1655,10 +1715,11 @@ class Planner {
         sx[0] = cx; sy[0] = cy;
         for (int i = 0; i < bx.length; i++) { sx[i + 1] = bx[i]; sy[i + 1] = by[i]; }
         Sim s = new Sim(wd, n);
+        s.dt = 0.05f;               // грубый перебор считаем крупным шагом
         float gx0 = sx[g], gy0 = sy[g];
         // грубый перебор: углы и силы
         ArrayList<float[]> cand = new ArrayList<>();   // {cost, ang, L0}
-        int na = 240;
+        int na = 360;
         for (int ia = 0; ia < na; ia++) {
             float ang = (float) (2 * Math.PI * ia / na);
             s.reset(sx, sy); s.shoot(ang, L0MAX); s.run(9000, 0, null);
@@ -1670,8 +1731,9 @@ class Planner {
                 float c = luckyCost(s, g, tx, ty);
                 cand.add(new float[]{c, ang, L0});
             }
-            if ((System.nanoTime() - t0) / 1000000 > budgetMs * 0.5) break;
+            if ((System.nanoTime() - t0) / 1000000 > budgetMs * 0.55) break;
         }
+        s.dt = DT;                  // уточнение и проверка - мелким шагом
         cand.sort((p, q) -> Float.compare(p[0], q[0]));
         // уточнение лучших кандидатов (разные по углу)
         ArrayList<float[]> top = new ArrayList<>();

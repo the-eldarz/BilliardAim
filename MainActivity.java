@@ -13,6 +13,7 @@ import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -97,6 +98,25 @@ public class MainActivity extends Activity {
         });
         ll.addView(mg, lp(4));
         ll.addView(modeNote, lp(2));
+
+        TextView ex = new TextView(this);
+        ex.setText("Дополнительные функции (в режиме «Автоскан»)");
+        ex.setTextSize(16);
+        ll.addView(ex, lp(24));
+        CheckBox cbH = new CheckBox(this);
+        cbH.setText("Подсказка: лучший удар в партии");
+        cbH.setChecked(prefs().getBoolean("hint_on", false));
+        cbH.setOnCheckedChangeListener((v, on) -> prefs().edit().putBoolean("hint_on", on).apply());
+        ll.addView(cbH, lp(2));
+        CheckBox cbL = new CheckBox(this);
+        cbL.setText("Lucky Shot: удар золотым шаром в центр мишени");
+        cbL.setChecked(prefs().getBoolean("lucky_on", false));
+        cbL.setOnCheckedChangeListener((v, on) -> prefs().edit().putBoolean("lucky_on", on).apply());
+        ll.addView(cbL, lp(2));
+        TextView exNote = new TextView(this);
+        exNote.setTextSize(13);
+        exNote.setText("Если включить, в автоскане слева появятся кнопки «Скан подсказка» и «Скан LS». Они разбирают стол по нажатию. Изменения применяются при следующем включении линейки.");
+        ll.addView(exNote, lp(2));
 
         TextView th = new TextView(this);
         th.setText("Тема оформления");
