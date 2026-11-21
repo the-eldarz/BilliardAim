@@ -578,6 +578,165 @@ class Vision {
         o[0] = h; o[1] = mx == 0 ? 0 : d / mx; o[2] = mx;
     }
 
+    // ---- Угловые лузы: опора для геометрии стола, одинаковая для всех скинов ----
+    static float[] pocketFrame(int[] px, int w, int h) {
+        // от самого строгого порога «чёрного» к мягкому: у тёмных столов края сукна не должны слипаться с лузами
+        int[] thr = {26, 12, 40};
+        for (int v : thr) {
+            float[] f = pocketFrameT(px, w, h, v);
+            if (f != null) return f;
+        }
+        return null;
+    }
+
+    static float[] pocketFrameT(int[] px, int w, int h, int thr) {
+        int mw = w / 2, mh = h / 2;
+        boolean[] dk = new boolean[mw * mh];
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
+            int p = px[(y * 2) * w + x * 2];
+            dk[y * mw + x] = Math.max(R(p), Math.max(G(p), B(p))) < thr;
+        }
+        int[] lab = label(dk, mw, mh);
+        int n = 0; for (int v : lab) if (v > n) n = v;
+        if (n == 0 || n > 6000) return null;
+        int[] cnt = new int[n + 1], x0 = new int[n + 1], x1 = new int[n + 1], y0 = new int[n + 1], y1 = new int[n + 1];
+        double[] sx = new double[n + 1], sy = new double[n + 1];
+        for (int i = 1; i <= n; i++) { x0[i] = mw; y0[i] = mh; x1[i] = -1; y1[i] = -1; }
+        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
+            int v = lab[y * mw + x]; if (v == 0) continue;
+            cnt[v]++; sx[v] += x; sy[v] += y;
+            if (x < x0[v]) x0[v] = x; if (x > x1[v]) x1[v] = x; if (y < y0[v]) y0[v] = y; if (y > y1[v]) y1[v] = y;
+        }
+        ArrayList<float[]> c = new ArrayList<>();
+        for (int v = 1; v <= n; v++) {
+            float bw = (x1[v] - x0[v] + 1) * 2f, bh = (y1[v] - y0[v] + 1) * 2f;
+            if (bw < 0.026f * w || bw > 0.045f * w || bh < 0.026f * w || bh > 0.045f * w) continue;   // размер угловой лузы (кружки счёта меньше)
+            if (cnt[v] * 4f < 0.40f * bw * bh) continue;
+            float asp = bw / bh; if (asp < 0.6f || asp > 1.67f) continue;
+            c.add(new float[]{(float) (sx[v] / cnt[v]) * 2f, (float) (sy[v] / cnt[v]) * 2f});
+            if (c.size() >= 14) break;
+        }
+        int m = c.size();
+        float bestW = 0; float[] out = null;
+        float tx = 0.012f * w, ty = 0.02f * h;
+        for (int a = 0; a < m; a++) for (int b = 0; b < m; b++) for (int d = 0; d < m; d++) for (int e = 0; e < m; e++) {
+            if (a == b || a == d || a == e || b == d || b == e || d == e) continue;
+            float[] tl = c.get(a), tr = c.get(b), bl = c.get(d), br = c.get(e);
+            if (tl[0] >= tr[0] || bl[0] >= br[0] || tl[1] >= bl[1] || tr[1] >= br[1]) continue;
+            if (Math.abs(tl[1] - tr[1]) > ty || Math.abs(bl[1] - br[1]) > ty) continue;
+            if (Math.abs(tl[0] - bl[0]) > tx || Math.abs(tr[0] - br[0]) > tx) continue;
+            float wd = (tr[0] + br[0] - tl[0] - bl[0]) / 2f, ht = (bl[1] + br[1] - tl[1] - tr[1]) / 2f;
+            if (wd < 0.4f * w || ht <= 0 || wd / ht < 1.85f || wd / ht > 2.1f) continue;
+            if (wd > bestW) {
+                bestW = wd;
+                out = new float[]{(tl[0] + bl[0]) / 2f + 0.0068f * wd, (tr[0] + br[0]) / 2f - 0.0068f * wd,
+                                  (tl[1] + tr[1]) / 2f + 0.0070f * wd, (bl[1] + br[1]) / 2f - 0.0070f * wd};
+            }
+        }
+        if (out == null) {
+            // запасной вариант: две угловые лузы одной стороны + известное соотношение сторон стола (1477:750)
+            for (int a = 0; a < m; a++) for (int b = 0; b < m; b++) {
+                if (a == b) continue;
+                float[] p1 = c.get(a), p2 = c.get(b);
+                if (p1[0] >= p2[0] || Math.abs(p1[1] - p2[1]) > ty) continue;
+                float wd = p2[0] - p1[0];
+                if (wd < 0.4f * w || wd > 0.9f * w) continue;
+                float ht = wd / 1.9693f, yy = (p1[1] + p2[1]) / 2f;
+                float yTop = yy < h / 2f ? yy : yy - ht, yBot = yTop + ht;
+                if (yTop < 0 || yBot > h) continue;
+                if (wd > bestW) {
+                    bestW = wd;
+                    out = new float[]{p1[0] + 0.0068f * wd, p2[0] - 0.0068f * wd, yTop + 0.0070f * wd, yBot - 0.0070f * wd};
+                }
+            }
+        }
+        return out;
+    }
+
+    // ---- Локальная модель цвета сукна: ловит шары того же оттенка, что и сукно (красные на красном, зелёные на зелёном) ----
+    static final float CELL = 48f;
+    static boolean useModel = false;
+    static float[] mdl; static int mdlW, mdlH; static float mdlX0, mdlY0;
+
+    static void buildModel(int[] px, int w, int h, float il, float it, float ir, float ib, float h0) {
+        float[] t = new float[3];
+        mdlX0 = il; mdlY0 = it;
+        mdlW = (int) ((ir - il) / CELL) + 2; mdlH = (int) ((ib - it) / CELL) + 2;
+        float[] g = new float[mdlW * mdlH * 3];
+        boolean[] ok = new boolean[mdlW * mdlH];
+        int[] hr = new int[256], hg = new int[256], hb = new int[256];
+        int good = 0;
+        for (int j = 0; j < mdlH; j++) for (int i = 0; i < mdlW; i++) {
+            // только внутри игровой зоны: борта и их тени в модель сукна не попадают
+            int xa = Math.max(Math.max(0, (int) il), (int) (il + (i - 0.5f) * CELL)), xb = Math.min(Math.min(w, (int) ir), (int) (il + (i + 0.5f) * CELL));
+            int ya = Math.max(Math.max(0, (int) it), (int) (it + (j - 0.5f) * CELL)), yb = Math.min(Math.min(h, (int) ib), (int) (it + (j + 0.5f) * CELL));
+            java.util.Arrays.fill(hr, 0); java.util.Arrays.fill(hg, 0); java.util.Arrays.fill(hb, 0);
+            int cn = 0;
+            for (int y = ya; y < yb; y += 2) for (int x = xa; x < xb; x += 2) {
+                int p = px[y * w + x];
+                if (!cloth(p, h0, t)) continue;
+                hr[R(p)]++; hg[G(p)]++; hb[B(p)]++; cn++;
+            }
+            if (cn < 30) continue;
+            int q = (j * mdlW + i) * 3;
+            g[q] = med(hr, cn); g[q + 1] = med(hg, cn); g[q + 2] = med(hb, cn);
+            ok[j * mdlW + i] = true; good++;
+        }
+        if (good < 6) { useModel = false; return; }
+        // пустые ячейки: среднее по заполненным соседям
+        for (int pass = 0; pass < 8; pass++) {
+            boolean any = false;
+            boolean[] nok = ok.clone();
+            for (int j = 0; j < mdlH; j++) for (int i = 0; i < mdlW; i++) {
+                if (ok[j * mdlW + i]) continue;
+                float sr = 0, sg = 0, sb = 0; int nn = 0;
+                for (int dj = -1; dj <= 1; dj++) for (int di = -1; di <= 1; di++) {
+                    int jj = j + dj, ii = i + di;
+                    if (jj < 0 || ii < 0 || jj >= mdlH || ii >= mdlW || !ok[jj * mdlW + ii]) continue;
+                    int q = (jj * mdlW + ii) * 3; sr += g[q]; sg += g[q + 1]; sb += g[q + 2]; nn++;
+                }
+                if (nn > 0) { int q = (j * mdlW + i) * 3; g[q] = sr / nn; g[q + 1] = sg / nn; g[q + 2] = sb / nn; nok[j * mdlW + i] = true; any = true; }
+            }
+            ok = nok;
+            if (!any) break;
+        }
+        // медианный фильтр 3x3: убирает ячейки, где шар закрыл больше половины
+        float[] f = new float[g.length];
+        float[] buf = new float[9];
+        for (int j = 0; j < mdlH; j++) for (int i = 0; i < mdlW; i++) for (int ch = 0; ch < 3; ch++) {
+            int nn = 0;
+            for (int dj = -1; dj <= 1; dj++) for (int di = -1; di <= 1; di++) {
+                int jj = Math.max(0, Math.min(mdlH - 1, j + dj)), ii = Math.max(0, Math.min(mdlW - 1, i + di));
+                buf[nn++] = g[(jj * mdlW + ii) * 3 + ch];
+            }
+            java.util.Arrays.sort(buf, 0, nn);
+            f[(j * mdlW + i) * 3 + ch] = buf[nn / 2];
+        }
+        mdl = f; useModel = true;
+    }
+
+    /** Не сукно: либо оттенок не тот, либо пиксель заметно отличается от местного цвета сукна (ярче или другой цветовой тон). */
+    static boolean nonCloth(int p, int x, int y, float h0, float[] t) {
+        if (!cloth(p, h0, t)) return true;
+        if (!useModel) return false;
+        float fx = (x - mdlX0) / CELL, fy = (y - mdlY0) / CELL;
+        fx = Math.max(0f, Math.min(mdlW - 1.001f, fx)); fy = Math.max(0f, Math.min(mdlH - 1.001f, fy));
+        int ix = (int) fx, iy = (int) fy; float ax = fx - ix, ay = fy - iy;
+        float[] mc = new float[3];
+        for (int ch = 0; ch < 3; ch++) {
+            float a = mdl[(iy * mdlW + ix) * 3 + ch], b = mdl[(iy * mdlW + ix + 1) * 3 + ch];
+            float c = mdl[((iy + 1) * mdlW + ix) * 3 + ch], d = mdl[((iy + 1) * mdlW + ix + 1) * 3 + ch];
+            mc[ch] = a * (1 - ax) * (1 - ay) + b * ax * (1 - ay) + c * (1 - ax) * ay + d * ax * ay;
+        }
+        float pr = R(p), pg = G(p), pb = B(p);
+        float np = (float) Math.sqrt(pr * pr + pg * pg + pb * pb), nm = (float) Math.sqrt(mc[0] * mc[0] + mc[1] * mc[1] + mc[2] * mc[2]);
+        if (nm < 1f || np < 1f) return false;
+        if (np > 1.33f * nm) return true;                  // ярче сукна: блик, шар
+        if (np < 0.58f * nm) return true;                  // заметно темнее сукна: тёмный шар (бордовый, коричневый)
+        float dr = pr / np - mc[0] / nm, dg = pg / np - mc[1] / nm, db = pb / np - mc[2] / nm;
+        return dr * dr + dg * dg + db * db > 0.12f * 0.12f; // другой цветовой тон
+    }
+
     // 0 = сукно ищем по оттенку (цветные столы), 1 = по близости к основному цвету (серые, чёрные, бледные столы)
     static int clothMode = 0;
     static float refR, refG, refB, refV;
@@ -599,7 +758,7 @@ class Vision {
         hsv(p, t);
         float dh = Math.abs(t[0] - h0);
         if (dh > 180) dh = 360 - dh;
-        return dh <= 14f && t[1] > 0.35f && t[2] > 0.30f;
+        return dh <= 14f && t[1] > 0.35f && t[2] > 0.12f;   // тёмные края сукна у бортов тоже сукно
     }
 
     static boolean whiteish(int p) {
@@ -653,7 +812,18 @@ class Vision {
         Result r2 = detectImpl(px, w, h);
         if (r2.tableOk) return r2;
         clothMode = 0;
+        r1.msg = r1.msg + " [" + w + "x" + h + ", центр " + centerInfo(px, w, h) + "; запасной: " + r2.msg + "]";
         return r1;
+    }
+
+    static String centerInfo(int[] px, int w, int h) {
+        int[] qr = new int[256], qg = new int[256], qb = new int[256]; int tot = 0;
+        for (int y = h / 2 - 60; y <= h / 2 + 60; y += 2) for (int x = w / 2 - 120; x <= w / 2 + 120; x += 2) {
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            int pp = px[y * w + x]; qr[R(pp)]++; qg[G(pp)]++; qb[B(pp)]++; tot++;
+        }
+        if (tot == 0) return "?";
+        return "RGB " + med(qr, tot) + "," + med(qg, tot) + "," + med(qb, tot);
     }
 
     static Result detectImpl(int[] px, int w, int h) {
@@ -691,31 +861,41 @@ class Vision {
             h0 = bi * 5f + 2.5f;
         }
 
-        // 2. Стол: самая большая область цвета сукна (в половинном разрешении)
-        int mw = w / 2, mh = h / 2;
-        boolean[] cm = new boolean[mw * mh];
-        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) cm[y * mw + x] = cloth(px[(y * 2) * w + x * 2], h0, t);
-        int[] lab = label(cm, mw, mh);
-        int best = -1, bestCnt = 0;
-        int nlab = 0;
-        for (int v : lab) if (v > nlab) nlab = v;
-        int[] cnt = new int[nlab + 1]; int[] bx0 = new int[nlab + 1], bx1 = new int[nlab + 1], by0 = new int[nlab + 1], by1 = new int[nlab + 1];
-        for (int i = 1; i <= nlab; i++) { bx0[i] = mw; by0[i] = mh; bx1[i] = -1; by1[i] = -1; }
-        for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
-            int v = lab[y * mw + x]; if (v == 0) continue;
-            cnt[v]++; if (x < bx0[v]) bx0[v] = x; if (x > bx1[v]) bx1[v] = x; if (y < by0[v]) by0[v] = y; if (y > by1[v]) by1[v] = y;
+        // 2. Стол. Сначала по угловым лузам (тёмные круги: не зависят от цвета стола),
+        //    запасной вариант: самая большая область цвета сукна (в половинном разрешении)
+        useModel = false;
+        float il, ir, it, ib, ow;
+        float[] pf = pocketFrame(px, w, h);
+        if (pf != null) {
+            il = pf[0]; ir = pf[1]; it = pf[2]; ib = pf[3];
+            ow = (ir - il) + 58f;
+        } else {
+            int mw = w / 2, mh = h / 2;
+            boolean[] cm = new boolean[mw * mh];
+            for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) cm[y * mw + x] = cloth(px[(y * 2) * w + x * 2], h0, t);
+            int[] lab = label(cm, mw, mh);
+            int best = -1, bestCnt = 0;
+            int nlab = 0;
+            for (int v : lab) if (v > nlab) nlab = v;
+            int[] cnt = new int[nlab + 1]; int[] bx0 = new int[nlab + 1], bx1 = new int[nlab + 1], by0 = new int[nlab + 1], by1 = new int[nlab + 1];
+            for (int i = 1; i <= nlab; i++) { bx0[i] = mw; by0[i] = mh; bx1[i] = -1; by1[i] = -1; }
+            for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
+                int v = lab[y * mw + x]; if (v == 0) continue;
+                cnt[v]++; if (x < bx0[v]) bx0[v] = x; if (x > bx1[v]) bx1[v] = x; if (y < by0[v]) by0[v] = y; if (y > by1[v]) by1[v] = y;
+            }
+            for (int i = 1; i <= nlab; i++) if (cnt[i] > bestCnt) { bestCnt = cnt[i]; best = i; }
+            if (best < 0) { res.msg = "Стол не найден."; return res; }
+            int oL = bx0[best] * 2, oR = bx1[best] * 2 + 1, oT = by0[best] * 2, oB = by1[best] * 2 + 1;
+            ow = oR - oL;
+            float oh = oB - oT;
+            if (ow < w * 0.35f || ow / oh < 1.3f || ow / oh > 2.6f) { res.msg = "Стол найден неверно. Откройте игру на весь экран (альбомная ориентация)."; return res; }
+            int k = Math.round(0.0191f * ow); // ширина бортовой полосы
+            il = oL + k; ir = oR - k; it = oT + k; ib = oB - k;
         }
-        for (int i = 1; i <= nlab; i++) if (cnt[i] > bestCnt) { bestCnt = cnt[i]; best = i; }
-        if (best < 0) { res.msg = "Стол не найден."; return res; }
-        int oL = bx0[best] * 2, oR = bx1[best] * 2 + 1, oT = by0[best] * 2, oB = by1[best] * 2 + 1;
-        float ow = oR - oL, oh = oB - oT;
-        if (ow < w * 0.35f || ow / oh < 1.3f || ow / oh > 2.6f) { res.msg = "Стол найден неверно. Откройте игру на весь экран (альбомная ориентация)."; return res; }
-        int k = Math.round(0.0191f * ow); // ширина бортовой полосы
-        res.l = oL + k; res.rr = oR - k; res.t = oT + k; res.b = oB - k;
-        float il = res.l, ir = res.rr, it = res.t, ib = res.b;
         float r0 = 0.0151f * (ir - il);
         res.tableOk = true;
         res.l = il; res.rr = ir; res.t = it; res.b = ib; res.r = r0;
+        buildModel(px, w, h, il, it, ir, ib, h0);
 
         // 3. Биток: белое круглое пятно. Считаем долю «белых» пикселей в квадрате по интегральному изображению.
         int W1 = w + 1;
@@ -777,6 +957,42 @@ class Vision {
         res.ax = (float) bestFit[4]; res.ay = (float) bestFit[5];
         if (DEBUG) System.out.printf("[dbg] угол=%.2f° длина линии=%.0f%n", Math.toDegrees(ang), bestLen);
 
+        // 5. Шары по форме (круги радиуса R): не зависит от цвета сукна. Цветовой поиск ниже - только запасной вариант.
+        boolean shapeOk = false;
+        peakT = 6.8f * r;
+        float[][] sp = shapePeaks(px, w, h, res, false);
+        if (sp.length >= 3) {
+            // кольцо «призрачного» битка: его центр точнее конца белой линии
+            int ri = -1; double rd = 0.7f * r;
+            for (int i = 0; i < sp.length; i++) {
+                double d0 = Math.hypot(sp[i][0] - res.ax, sp[i][1] - res.ay);
+                if (d0 < rd) { rd = d0; ri = i; }
+            }
+            if (ri >= 0) { res.ax = sp[ri][0]; res.ay = sp[ri][1]; }
+            float pcx = (res.l + res.rr) / 2f;
+            float[] sox = new float[sp.length], soy = new float[sp.length]; int no = 0;
+            int oi = -1; double oBest = 1e9; float dTarget = 1.923f * r;
+            for (int i = 0; i < sp.length; i++) {
+                if (i == ri) continue;
+                float X = sp[i][0], Y = sp[i][1];
+                if (Math.hypot(X - res.cx, Y - res.cy) < 1.2f * r) continue;   // биток
+                double dg = Math.hypot(X - res.ax, Y - res.ay);
+                if (dg < 0.8f * r) continue;                                    // кольцо
+                boolean nearL = X < res.l + 2.6f * r || X > res.rr - 2.6f * r;
+                boolean nearT = Y < res.t + 2.6f * r || Y > res.b - 2.6f * r;
+                if (nearL && nearT) continue;                                   // угловая лунка
+                if (Math.abs(X - pcx) < 2.3f * r && (Y < res.t + 2.3f * r || Y > res.b - 2.3f * r)) continue; // боковая лунка
+                sox[no] = X; soy[no] = Y;
+                double ahead = (X - res.ax) * dx + (Y - res.ay) * dy;
+                double dev = Math.abs(dg - dTarget);
+                if (dg > 1.5f * r && dg < 2.6f * r && ahead > 0 && dev < oBest) { oBest = dev; oi = no; }
+                no++;
+            }
+            res.nb = no; res.bx = java.util.Arrays.copyOf(sox, no); res.by = java.util.Arrays.copyOf(soy, no);
+            if (oi >= 0) { res.hasObj = true; res.ox = sox[oi]; res.oy = soy[oi]; }
+            shapeOk = true;
+        }
+        if (!shapeOk) {
         // 5. Шар, в который целимся: касается «призрачного» битка (расстояние 2r), в стороне удара
         double bestScore = -1, bestDelta = 9, bestPhi = 0;
         for (double dphi = -100; dphi <= 100; dphi += 1.5) {
@@ -803,6 +1019,7 @@ class Vision {
             res.hasObj = true; res.ox = (float) (sx / n); res.oy = (float) (sy / n);
         }
         findBalls(px, w, h, res, h0);
+        }
         res.ok = true;
         res.msg = res.hasObj ? "Готово: стол, биток, прицел и шар найдены." : "Стол, биток и прицел найдены. Шар на линии не найден (линия идёт в борт).";
         return res;
@@ -810,6 +1027,108 @@ class Vision {
 
     /** Ищет белую линию прицела, выходящую из точки (cx,cy). Возвращает {длина, угол, cx', cy', конецX, конецY} или null. */
     /** Все шары на столе (кроме битка): «не сукно» -> стирание тонких линий и кия -> центры пятен; слипшиеся пятна делим усиленным стиранием. */
+    /** Шары по форме, а не по цвету: каждая точка края голосует за центр круга радиуса R по направлению градиента. */
+    static float edgeT = 110f, peakT = 60f;
+    static float[][] shapePeaks(int[] px, int w, int h, Result res, boolean debug) {
+        int il = Math.round(res.l), it = Math.round(res.t), ir = Math.round(res.rr), ib = Math.round(res.b);
+        float r = res.r;
+        int mw = (ir - il) / 2 + 1, mh = (ib - it) / 2 + 1;
+        float[] acc = new float[mw * mh];
+        for (int y = 1; y < mh - 1; y++) for (int x = 1; x < mw - 1; x++) {
+            int X = il + 2 * x, Y = it + 2 * y;
+            if (X + 2 >= w || Y + 2 >= h || X - 2 < 0 || Y - 2 < 0) continue;
+            int a = px[(Y - 2) * w + X - 2], b = px[(Y - 2) * w + X], c = px[(Y - 2) * w + X + 2];
+            int d = px[Y * w + X - 2], f = px[Y * w + X + 2];
+            int g = px[(Y + 2) * w + X - 2], hh = px[(Y + 2) * w + X], k = px[(Y + 2) * w + X + 2];
+            float bgx = 0, bgy = 0, bm = 0;
+            for (int sh = 0; sh <= 16; sh += 8) {
+                int gx = (((c >> sh) & 255) + 2 * ((f >> sh) & 255) + ((k >> sh) & 255)) - (((a >> sh) & 255) + 2 * ((d >> sh) & 255) + ((g >> sh) & 255));
+                int gy = (((g >> sh) & 255) + 2 * ((hh >> sh) & 255) + ((k >> sh) & 255)) - (((a >> sh) & 255) + 2 * ((b >> sh) & 255) + ((c >> sh) & 255));
+                float m2 = gx * gx + gy * gy;
+                if (m2 > bm) { bm = m2; bgx = gx; bgy = gy; }
+            }
+            float gm = (float) Math.sqrt(bm);
+            if (gm < edgeT) continue;
+            float ux = bgx / gm, uy = bgy / gm;
+            for (int sg = -1; sg <= 1; sg += 2) for (int q = -1; q <= 1; q++) {
+                float rr = (r + 1.5f * q) / 2f;
+                int cx = Math.round(x + sg * rr * ux), cy = Math.round(y + sg * rr * uy);
+                if (cx < 0 || cy < 0 || cx >= mw || cy >= mh) continue;
+                acc[cy * mw + cx] += 1f;
+            }
+        }
+        // сглаживание 3x3
+        float[] sm = new float[mw * mh];
+        for (int y = 1; y < mh - 1; y++) for (int x = 1; x < mw - 1; x++) {
+            float v = 0;
+            for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) v += acc[(y + dy) * mw + x + dx];
+            sm[y * mw + x] = v;
+        }
+        // локальные максимумы
+        ArrayList<float[]> pk = new ArrayList<>();
+        int rad = Math.max(2, Math.round(r / 2f * 0.6f));
+        for (int y = rad; y < mh - rad; y++) for (int x = rad; x < mw - rad; x++) {
+            float v = sm[y * mw + x];
+            if (v < peakT) continue;
+            boolean mx = true;
+            for (int dy = -rad; dy <= rad && mx; dy++) for (int dx = -rad; dx <= rad; dx++) {
+                if (sm[(y + dy) * mw + x + dx] > v || (sm[(y + dy) * mw + x + dx] == v && (dy < 0 || (dy == 0 && dx < 0)))) { mx = false; break; }
+            }
+            if (!mx) continue;
+            // уточнение центра по взвешенному центроиду 5x5
+            float sx = 0, sy = 0, sw = 0;
+            for (int dy = -2; dy <= 2; dy++) for (int dx = -2; dx <= 2; dx++) {
+                int xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= mw || yy >= mh) continue;
+                float q = sm[yy * mw + xx]; q = q * q; sx += q * xx; sy += q * yy; sw += q;
+            }
+            pk.add(new float[]{il + 2 * sx / sw, it + 2 * sy / sw, v});
+        }
+        pk.sort((p1, p2) -> Float.compare(p2[2], p1[2]));
+        ArrayList<float[]> out = new ArrayList<>();
+        for (float[] c : pk) {
+            boolean far = true;
+            for (float[] o : out) if (Math.hypot(c[0] - o[0], c[1] - o[1]) < 1.6f * r) { far = false; break; }
+            if (far) out.add(c);
+        }
+        float[][] res2 = out.toArray(new float[0][]);
+        for (float[] c : res2) { float[] q = refineCircle(px, w, h, c[0], c[1], r); c[0] = q[0]; c[1] = q[1]; }
+        return res2;
+    }
+
+    /** Точное положение центра: средний «голос» точек края вокруг шара (полное разрешение, несколько итераций). */
+    static float[] refineCircle(int[] px, int w, int h, float cx, float cy, float r) {
+        for (int iter = 0; iter < 4; iter++) {
+            double sx = 0, sy = 0; int n = 0;
+            int x0 = Math.max(2, (int) (cx - 1.4f * r)), x1 = Math.min(w - 3, (int) (cx + 1.4f * r));
+            int y0 = Math.max(2, (int) (cy - 1.4f * r)), y1 = Math.min(h - 3, (int) (cy + 1.4f * r));
+            for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) {
+                float dx = x - cx, dy = y - cy;
+                float d = (float) Math.sqrt(dx * dx + dy * dy);
+                if (d < 0.7f * r || d > 1.3f * r) continue;
+                int a = px[(y - 1) * w + x - 1], b = px[(y - 1) * w + x], c = px[(y - 1) * w + x + 1];
+                int dd = px[y * w + x - 1], f = px[y * w + x + 1];
+                int g = px[(y + 1) * w + x - 1], hh = px[(y + 1) * w + x], k = px[(y + 1) * w + x + 1];
+                float bgx = 0, bgy = 0, bm = 0;
+                for (int sh = 0; sh <= 16; sh += 8) {
+                    int gx = (((c >> sh) & 255) + 2 * ((f >> sh) & 255) + ((k >> sh) & 255)) - (((a >> sh) & 255) + 2 * ((dd >> sh) & 255) + ((g >> sh) & 255));
+                    int gy = (((g >> sh) & 255) + 2 * ((hh >> sh) & 255) + ((k >> sh) & 255)) - (((a >> sh) & 255) + 2 * ((b >> sh) & 255) + ((c >> sh) & 255));
+                    float m2 = gx * gx + gy * gy;
+                    if (m2 > bm) { bm = m2; bgx = gx; bgy = gy; }
+                }
+                float gm = (float) Math.sqrt(bm);
+                if (gm < 0.8f * edgeT) continue;
+                float ux = bgx / gm, uy = bgy / gm;
+                float dot = (ux * dx + uy * dy) / d;
+                if (Math.abs(dot) < 0.85f) continue;                 // край должен быть направлен по радиусу
+                float sg = dot > 0 ? -1f : 1f;
+                sx += x + sg * r * ux; sy += y + sg * r * uy; n++;
+            }
+            if (n < 20) break;
+            cx = (float) (sx / n); cy = (float) (sy / n);
+        }
+        return new float[]{cx, cy};
+    }
+
     static void findBalls(int[] px, int w, int h, Result res, float h0) {
         float[] t = new float[3];
         float r = res.r;
@@ -819,7 +1138,7 @@ class Vision {
         for (int y = 0; y < mh; y++) for (int x = 0; x < mw; x++) {
             int X = il + 2 * x, Y = it + 2 * y;
             if (X >= w || Y >= h) continue;
-            m[y * mw + x] = !cloth(px[Y * w + X], h0, t);
+            m[y * mw + x] = nonCloth(px[Y * w + X], X, Y, h0, t);
         }
         int e = Math.max(2, Math.round(0.42f * r / 2f));
         double single = Math.PI * Math.pow(0.9 * r / 2 - e, 2);
@@ -938,7 +1257,7 @@ class Vision {
             int xx = Math.round(cx + x), yy = Math.round(cy + y);
             if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
             tot++;
-            if (!cloth(px[yy * w + xx], h0, t)) non++;
+            if (nonCloth(px[yy * w + xx], xx, yy, h0, t)) non++;
         }
         return tot == 0 ? 0 : non / (double) tot;
     }
